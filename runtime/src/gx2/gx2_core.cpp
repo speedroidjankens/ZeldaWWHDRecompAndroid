@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -617,6 +618,42 @@ static uint64_t vclock_index(int64_t t) {  // g_vclock_mutex held
     uint64_t i = g_vclock_base_index + (d > 0 ? (uint64_t)(d / vclock_period()) : 0);
     return g_vclock_last = std::max(i, g_vclock_last);  // re-phasing never moves it back
 }
+// (merge fix: restored verbatim from Enhanced; the merge kept the caller in
+// display_vsync.cpp but dropped this definition)
+// a display vsync (CLOCK_MONOTONIC ns) and the display's refresh period
+void gx2_display_vsync(int64_t vsync_ns, int64_t display_period) {
+    static const bool off = getenv("WWHD_NO_VSYNC_LOCK") != nullptr;
+    if (off || display_period <= 0) return;
+    // frame interpolation at 120/240 fps and 40 fps (interp.cpp): the clock runs 2/4 times as fast
+    // (40 fps: at 120 Hz, a frame takes 3 of its vsyncs)
+    const int64_t target = kVsyncPeriod / std::max(1, interp::vsync_rate());
+    int64_t n = std::max<int64_t>(1, (target + display_period / 2) / display_period);
+    int64_t period = n * display_period;
+    std::lock_guard<std::mutex> lk(g_vclock_mutex);
+    if (g_vclock_rate != 1.0) return;  // fast forward: free running until it ends
+    if (std::abs(period - target) * 50 > target) {  // e.g. 90 Hz: no multiple near 60 Hz
+        if (g_vclock_period != target) {
+            int64_t now = steady_ns();
+            g_vclock_base_index = vclock_index(now);
+            g_vclock_base_ns = now;
+            g_vclock_period = target;
+        }
+        return;
+    }
+    if (std::abs(period - g_vclock_period) * 200 > period) {  // new rate (beyond 0.5% jitter): continue from the current index
+        g_vclock_base_index = vclock_index(steady_ns());
+        g_vclock_base_ns = vsync_ns;
+        g_vclock_period = period;
+        LOG("[gx2] vsync locked to the display: %.2f Hz (%lld x %.2f Hz)", 1e9 / period, (long long)n, 1e9 / display_period);
+        return;
+    }
+    // phase: move our vsyncs onto the nearest display vsync
+    int64_t err = (vsync_ns - g_vclock_base_ns) % display_period;
+    if (err < 0) err += display_period;
+    if (err > display_period / 2) err -= display_period;
+    if (std::abs(err) > 250000) g_vclock_base_ns += err;
+}
+
 // a flip also waits for the GPU to finish that frame, as on hardware: the game reuses a frame's
 // buffers once its flip has executed
 struct PendingFlip { uint64_t vsync, swap; uint8_t waitedRender = 0, waitedGpu = 0; };

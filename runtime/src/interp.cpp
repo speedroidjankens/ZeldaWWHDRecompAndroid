@@ -1201,6 +1201,15 @@ void blend_mtx(const float* a, const float* b, float* out, float t) {
 void blend_world_matrix(const float* a, const float* b, float* out, float t) { blend_mtx(a, b, out, t); }
 }  // namespace interp
 
+// (merge fix: Enhanced's note_play_draw was dropped by the merge; true60.cpp
+// site_025B00B0 calls it on every play-scene draw. Enhanced's menu_open /
+// menu30_update that also used g_play_draw_step were NOT restored: Modern's
+// pass structure superseded them and nothing in the merged tree calls them.)
+static uint64_t g_play_draw_step = 0;
+namespace interp {
+void note_play_draw() { g_play_draw_step = g_logic_steps; }
+}  // namespace interp
+
 // The board assigns its pooled J3D hit/miss models by scanning cells at +0x598
 // (021C4F34), so an earlier cell inserted by a shot shifts later assignments.
 // Carry that cell identity into the matrix history. The board, cursor, ships and
