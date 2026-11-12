@@ -1259,37 +1259,7 @@ void request_window_frame_rate(ANativeWindow* window, float hz, int8_t compatibi
         r = ANativeWindow_setFrameRate(window, hz, compatibility);
     if (r) LOG("[vk] window frame-rate request %.1f Hz failed: %d", hz, r);
 }
-// The display rate the window asks for, from the frames shown per second (30, or what frame
-// interpolation draws: interp::frames_per_step). Frame generation presents a steady multiple of it
-// (a 144 Hz panel can't space 60 or 120 fps evenly; 120 Hz can); without it at least 60 Hz, more for
-// interpolation at 120 fps. Checked every frame (the frame rate setting changes during play); Android
-// is asked only when it changes, or for a new window (force).
-static bool no_60hz_request() {
-    static const bool off = getenv("WWHD_NO_60HZ") != nullptr;
-    return off;
-}
-static float g_rate_requested = -1.0f;
-static void request_display_rate(ANativeWindow* window, bool force) {
-    if (!window) return;
-    const int shown = 30 * interp::frames_per_step();
-    float rate;
-    int8_t compat = ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT;
-    if (fg::loaded()) {
-        rate = (float)(shown * fg::config().multiplier);
-        compat = ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE;
-    } else {
-        // without it the game flips at most 60 times a second (more with interpolation): let a 90/120 Hz
-        // panel drop to 60 Hz (from pull request #8 by SSunnKing, 62a723b); WWHD_NO_60HZ=1 leaves it alone
-        rate = no_60hz_request() ? 0.0f : (float)std::max(60, shown);
-        if (interp::mode40()) rate = 120.0f;  // 40 fps: a frame every 3 refreshes of a 120 Hz panel
-    }
-    if (!force && rate == g_rate_requested) return;
-    g_rate_requested = rate;
-    request_window_frame_rate(window, rate, compat);
-    LOG("[vk] display rate requested: %.0f Hz%s", rate, fg::loaded() ? " (frame generation)" : "");
-}
-
-// g_window_mutex held; true if a swapchain is ready. `main`: the game window (frame generation
+// g_window_mutex held; true if a swapchain is ready. `main`: the game window (frame generation presents there); else the GamePad's own display
 static bool no_60hz_request() {
     static const bool off = getenv("WWHD_NO_60HZ") != nullptr;
     return off;
@@ -1317,6 +1287,7 @@ static void request_display_rate(ANativeWindow* window, bool force) {
         // without it the game flips at most 60 times a second (more with interpolation): let a 90/120 Hz
         // panel drop to 60 Hz (from pull request #8 by SSunnKing, 62a723b); WWHD_NO_60HZ=1 leaves it alone
         rate = no_60hz_request() ? 0.0f : (float)std::max(60, shown);
+        if (interp::mode40()) rate = 120.0f;  // 40 fps: a frame every 3 refreshes of a 120 Hz panel
     }
     // test: WWHD_DISPLAY_RATE=<Hz> asks for that rate as a fixed source (MediaTek FPSGO derives its target from it?)
     static const float testRate = getenv("WWHD_DISPLAY_RATE") ? (float)atof(getenv("WWHD_DISPLAY_RATE")) : 0.0f;
@@ -1326,11 +1297,10 @@ static void request_display_rate(ANativeWindow* window, bool force) {
     }
     if (!force && rate == g_rate_requested) return;
     g_rate_requested = rate;
-    ANativeWindow_setFrameRate(window, rate, compat);
+    request_window_frame_rate(window, rate, compat);
     LOG("[vk] display rate requested: %.0f Hz%s", rate, gen_on() ? " (frame generation)" : "");
 }
 
-// presents there); else the GamePad's own display
 bool ensure_swapchain(Swapchain& sc, bool main = true) {
     if (!sc.window) return false;
     if (sc.sc && !sc.stale) return true;
@@ -1493,6 +1463,18 @@ void fit(const ScreenRect& r, float a, float out[4], VkExtent2D ext, int mode = 
     out[0] = x / W; out[1] = y / H; out[2] = w / W; out[3] = h / H;
 }
 
+// a rect in window (layout) pixels -> the rotated image's pixels; matches the present vertex shader
+VkRect2D rotate_rect(VkRect2D r, VkExtent2D ext, uint32_t rot) {
+    int32_t W = (int32_t)ext.width, H = (int32_t)ext.height, x = r.offset.x, y = r.offset.y;
+    int32_t w = (int32_t)r.extent.width, h = (int32_t)r.extent.height;
+    switch (rot) {
+    case 1: return {{H - y - h, x}, {(uint32_t)h, (uint32_t)w}};
+    case 2: return {{W - x - w, H - y - h}, r.extent};
+    case 3: return {{y, W - x - w}, {(uint32_t)h, (uint32_t)w}};
+    default: return r;
+    }
+}
+
 // the shape of the TV picture's rect on screen: the aspect the game renders at in "screen" mode (aspect.cpp)
 void report_tv_shape(const ScreenRect& r, VkExtent2D ext) {
     if (r.w < 0) return;  // the TV picture is hidden (GamePad on demand): its shape stays
@@ -1513,7 +1495,7 @@ static bool backdrop_tv(const ScreenRect& tv, bool drcVisible) {
     return g_backdrop_tv.load(std::memory_order_relaxed) && tv.w < 0 && drcVisible && R.tv.img.image;
 }
 
-void draw_screen(VkCommandBuffer cmd, Screen& scr, const ScreenRect& r, VkExtent2D ext, int mode = 0) {
+void draw_screen(VkCommandBuffer cmd, Screen& scr, const ScreenRect& r, VkExtent2D ext, int mode = 0, uint32_t rot = 0) {
     if (!scr.img.image) return;
     float pc[8];
     fit(r, (float)scr.img.width / scr.img.height, pc, ext, mode);
@@ -1619,9 +1601,9 @@ bool present_frame() {
     vkCmdSetScissor(cmd, 0, 1, &sc);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_sc.pipeline);
     report_tv_shape(g_tv_rect, g_sc.extent);
-    if (g_tv_rect.w >= 0) draw_screen(cmd, R.tv, g_tv_rect, g_sc.extent, g_tv_aspect.load(std::memory_order_relaxed));
-    if (backdrop_tv(g_tv_rect, g_drc_visible)) draw_screen(cmd, R.tv, g_drc_rect, g_sc.extent);
-    else if (g_drc_visible) draw_screen(cmd, R.drc, g_drc_rect, g_sc.extent);
+    if (g_tv_rect.w >= 0) draw_screen(cmd, R.tv, g_tv_rect, g_sc.extent, g_tv_aspect.load(std::memory_order_relaxed), g_sc.rot);
+    if (backdrop_tv(g_tv_rect, g_drc_visible)) draw_screen(cmd, R.tv, g_drc_rect, g_sc.extent, 0, g_sc.rot);
+    else if (g_drc_visible) draw_screen(cmd, R.drc, g_drc_rect, g_sc.extent, 0, g_sc.rot);
     vkCmdEndRenderPass(cmd);
     on_complete([acquire] { g_acquire_free.push_back(acquire); });
     uint64_t submitId = submit(acquire, g_sc.renderDone[idx]);

@@ -860,19 +860,6 @@ JNI_FN(void, setPaused)(JNIEnv*, jclass, jboolean paused) {
     if (paused && g_started) gfx::save_caches();
 }
 
-// official artwork for the touch controls from the game files (IconForge)
-JNI_FN(jint, extractUiTextures)(JNIEnv* env, jclass, jstring gameDir, jstring outDir, jobjectArray layouts, jobjectArray textures) {
-    std::vector<ui_icons::Request> req;
-    jsize n = env->GetArrayLength(textures);
-    for (jsize i = 0; i < n; i++) {
-        auto l = (jstring)env->GetObjectArrayElement(layouts, i), t = (jstring)env->GetObjectArrayElement(textures, i);
-        req.push_back({jstr(env, l), jstr(env, t)});
-        env->DeleteLocalRef(l);
-        env->DeleteLocalRef(t);
-    }
-    return ui_icons::extract(jstr(env, gameDir), jstr(env, outDir), req);
-}
-
 // game state for the touch controls' icons (ControlsView)
 JNI_FN(jintArray, hudState)(JNIEnv* env, jclass) {
     int32_t s[touch_hud::kSize];

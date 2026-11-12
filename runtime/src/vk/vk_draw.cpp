@@ -494,7 +494,6 @@ struct Shader {
     bool dynamicUbos = false;
     bool used = false;                            // a draw asked for it this session (mark_used)
     uint32_t varsRange = 0;                       // size of the uniform-variable block
-    uint32_t areaUnits = 0;                       // pixel shader units read area-sampled (area_sample.h)
     uint32_t gatherUnits = 0;                     // pixel shader units it gathers from (area_sample.h gathered_units)
     bool areaGuest = false;                       // ... its area units read on the console's grid (the bloom extract)
     uint8_t sizeRequest = 0;                      // pixel shader: what its draws ask of their targets' size (area_sample.h)
@@ -2036,6 +2035,9 @@ static std::atomic<int> g_bloom_pct{[] {
     const char* e = getenv("WWHD_BLOOM_STRENGTH");
     return e ? std::clamp((int)(atof(e) * 100.0f), 0, 200) : 100;
 }()};
+// Graphics > Picture quality > blur at high resolutions (area_sample.h): the game's light and bloom
+// blur keeps its console footprint above ~1.5x (on by default; off: the game's one sample per tap)
+static std::atomic<bool> g_area_blur{[] { const char* e = getenv("WWHD_AREA_BLUR"); return !e || atoi(e) != 0; }()};
 bool area_blur() { return g_area_blur.load(std::memory_order_relaxed); }
 void set_area_blur(bool on) { g_area_blur = on; LOG("[gfx] console-accurate blur %s", on ? "on" : "off"); }
 int bloom_strength() { return g_bloom_pct.load(std::memory_order_relaxed); }
@@ -2637,11 +2639,7 @@ static VkImageView texture_view(Surface* s, VkImageViewType type, uint32_t word4
 // (PS 44BDFD00). The size mismatch is what leaves lines in shadowed grass. With this on, the
 // downsample is drawn a second time into a private 960x540 copy and the occlusion pass reads that
 // copy, one depth texel per pixel. Every other reader keeps the game's 640x360 buffer.
-// Graphics > Picture quality > blur at high resolutions (area_sample.h): the game's light and bloom
-// blur keeps its console footprint above ~1.5x (on by default; off: the game's one sample per tap)
-static std::atomic<bool> g_area_blur{[] { const char* e = getenv("WWHD_AREA_BLUR"); return !e || atoi(e) != 0; }()};
 bool area_blur_enabled() { return g_area_blur.load(std::memory_order_relaxed); }
-void set_area_blur(bool v) { g_area_blur = v; LOG("[gfx] area-sampled blur %s", v ? "on" : "off"); }
 static std::atomic<bool> g_ao_hires{[] { const char* e = getenv("WWHD_AO_HIRES"); return !e || atoi(e) != 0; }()};
 bool ao_hires_enabled() { return g_ao_hires.load(std::memory_order_relaxed); }
 void set_ao_hires(bool v) { g_ao_hires = v; LOG("[gfx] full-size occlusion depth %s", v ? "on" : "off"); }
@@ -5068,9 +5066,6 @@ static void record_draw(const uint32_t* regs, const Prepared& P, uint32_t prim, 
         draw(regs, prim, count, indexType, indexAddr, baseVertex, instances);
         g_hires_redraw = false;
     }
-    // a new command buffer since the indices were uploaded (render pass changes): upload them again
-    if (indices.n && R.cmdSerial != indicesSerial) draw_indices(prim, count, indexType, indexAddr, indices);
-    record_draw(regs, P, prim, count, indexType, indexAddr, baseVertex, instances, indices);
 }
 
 void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr, uint32_t baseVertex,
