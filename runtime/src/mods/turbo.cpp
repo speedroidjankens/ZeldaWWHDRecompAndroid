@@ -37,8 +37,10 @@
 #include <chrono>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 
 #include "mods.h"
+#include "turbo_steps.h"
 #include "runtime.h"
 #include "../release.h"
 
@@ -56,6 +58,7 @@ void f_025DF940(Cpu* c);       // fpcM_Execute (true60's per-process gate runs t
 void f_0252A684_orig(Cpu* c);  // dDoor_info_c::getDemoAction
 void f_021C0078_orig(Cpu* c);  // daMbdoor_c::getDemoAction
 void f_025DC86C_orig(Cpu* c);  // fopScnM_ChangeReq
+void f_025D57E0(Cpu* c);       // fopAcM_delete
 }
 
 namespace interp { bool hold_pass(); }
@@ -139,6 +142,32 @@ bool ff_now() {
     return m == 1 ? ff_dialogues() : (m == 2 || m == 3) ? ff_cutscenes() : false;
 }
 
+// debug: WWHD_MOD_DOOR_DELETE=1 runs process deletion in the extra steps too (the behaviour before
+// the fix of issue #61, for A/B runs: it can delete a process whose packets are still listed)
+const StepParts kDoorStep = [] {
+    StepParts p = kDoorExtraStep;
+    if (env_i("WWHD_MOD_DOOR_DELETE", 0)) p.deletion = true;
+    return p;
+}();
+
+// traces (WWHD_MODS_TRACE): the processes in the delete queue whose timer has run out, which the
+// next fpcDt_Handler deletes (g_fpcDtTg_Queue 101F3A1C, see fpcDt_Handler 025DE024; delete tag:
+// +8 next node, +0xC process, +0x18 timer, fpcDtTg_Do 025DDE44)
+const release::Data kDeleteQueue{0x101F3A1C};
+void trace_due_deletes(const char* when) {
+    if (!trace_on()) return;
+    uint32_t n = ld32(kDeleteQueue);
+    for (int k = 0; n && k < 512; k++, n = ld32(n + 8)) {
+        if (n < 0x10000000 || n >= 0x50000000) break;
+        int timer = (int16_t)ld16(n + 0x18);
+        if (timer > 0) continue;
+        uint32_t proc = ld32(n + 0xC);
+        uint32_t sub = proc ? ld32(proc + 0xF0) : 0;  // fopAc_ac_c::sub_method (true60.cpp kSubMethod)
+        uint32_t exec = sub >= 0x10000000 && sub < 0x50000000 ? ld32(sub + 8) : 0;
+        trace("%s: process %08X (execute %08X) due for deletion", when, proc, exec);
+    }
+}
+
 bool g_door_cut = false;  // a door asked for its cut during the logic step just run
 int g_door_action = -1;
 bool g_door_event = false;  // for traces: door event in progress
@@ -196,6 +225,39 @@ void call(Cpu* c, void (*f)(Cpu*), uint32_t r3) {
     c->r[3] = r3;
     f(c);
 }
+
+// test aid (issue #61): WWHD_TEST_DOOR_DELETE=FN (hex) queues the first actor whose execute
+// function is FN for deletion (fopAcM_delete) right after the first logic step of each door event,
+// as an actor deleting itself in that step would (a rat going into its hole, a pot breaking, Tingle
+// leaving). FN=list traces the actors (execute function, position) instead.
+constexpr uint32_t kActorQueue = 0x101F3328;  // g_fopAcTg_Queue (fopAcIt_Executor 025D51DC)
+uint32_t actor_execute(uint32_t a) {
+    uint32_t sub = ld32(a + 0xF0);  // fopAc_ac_c::sub_method (true60.cpp kSubMethod)
+    return sub >= 0x10000000 && sub < 0x50000000 ? ld32(sub + 8) : 0;
+}
+void test_door_delete(Cpu* c) {
+    static const char* e = getenv("WWHD_TEST_DOOR_DELETE");
+    if (!e) return;
+    const bool list = !strcmp(e, "list");
+    const uint32_t fn = (uint32_t)strtoul(e, nullptr, 16);
+    uint32_t n = ld32(kActorQueue);
+    for (int k = 0; n && k < 2048; k++, n = ld32(n + 8)) {
+        if (n < 0x10000000 || n >= 0x50000000) break;
+        uint32_t a = ld32(n + 0xC);
+        if (!a) continue;
+        uint32_t x = actor_execute(a);
+        if (list) {
+            trace("actor %08X execute %08X at (%.0f, %.0f, %.0f)", a, x, ldf32(a + 0x314), ldf32(a + 0x318), ldf32(a + 0x31C));
+        } else if (x == fn) {
+            trace("test: queueing actor %08X (execute %08X) for deletion in the door event", a, x);
+            uint32_t lr = c->lr, r3 = c->r[3];
+            call(c, f_025D57E0, a);  // fopAcM_delete
+            c->lr = lr;
+            c->r[3] = r3;
+            return;
+        }
+    }
+}
 }  // namespace
 
 void app_pause() { g_app_pause_ms = now_ms(); }
@@ -235,6 +297,18 @@ void hit_stop_step(uint32_t actor, bool before) {
     }
 }
 
+// Tick speed (this fork's setting): whole-game fast forward, 1-9x. The display clock
+// runs N times as fast, so the game plays N logic ticks per real second. 1 = normal.
+// Single digit only (the setting offers 1-9), so no accidental 99x. If the hardware
+// can't keep up, frames just come as fast as the device can draw them; the game only
+// runs slower than the number asked, nothing breaks. WWHD_TICK_SPEED=n sets it at start.
+static std::atomic<int> g_tick_speed{[] { int v = env_i("WWHD_TICK_SPEED", 1); return v < 1 ? 1 : v > 9 ? 9 : v; }()};
+int tick_speed() { return g_tick_speed.load(std::memory_order_relaxed); }
+void set_tick_speed(int v) {
+    v = v < 1 ? 1 : v > 9 ? 9 : v;  // single digit, 1-9
+    if (g_tick_speed.exchange(v) != v) LOG("[mods] tick speed %dx", v);
+}
+
 // interp.cpp's fpcEx_Handler hook, after the step's own execute
 void after_execute(Cpu* c, uint32_t execute_fn) {
     // in-between passes of the 60 fps modes: no 30 Hz logic ran (doors, scenes), nothing to do
@@ -246,6 +320,7 @@ void after_execute(Cpu* c, uint32_t execute_fn) {
     if (door != g_door_event) {
         g_door_event = door;
         trace("door event %s", door ? "running" : "done");
+        if (door) test_door_delete(c);
     }
     static bool ovl = false;
     if (overlap_active() != ovl) {
@@ -259,15 +334,22 @@ void after_execute(Cpu* c, uint32_t execute_fn) {
         mode = event_mode();
         LOG("[mods] event mode %d", mode);
     }
-    // fast forward: the display clock runs faster (gx2_core.cpp), so whole frames come faster
+    // fast forward: the display clock runs faster (gx2_core.cpp), so whole frames come faster.
+    // Tick speed (whole-game fast forward, 1-9x) wins over the event fast forward (ZR) when
+    // it is above 1x; otherwise the event fast forward's rate applies.
     bool ff = ff_now();
+    double rate = tick_speed() > 1 ? (double)tick_speed() : ff ? kFfRate : 1.0;
+    static double rate_was = 1.0;
+    if (rate != rate_was) {
+        rate_was = rate;
+        gx2::set_clock_rate(rate);
+#ifdef __ANDROID__
+        gfx::set_fast_forward(rate > 1.0);  // frame generation would pace the game to its own rate
+#endif
+    }
     static bool ff_was = false;
     if (ff != ff_was) {
         ff_was = ff;
-        gx2::set_clock_rate(ff ? kFfRate : 1.0);
-#ifdef __ANDROID__
-        gfx::set_fast_forward(ff);  // frame generation would pace the game to its own rate
-#endif
         // the speed reached: game frames per second of real time, against the normal 30
         static uint32_t f0 = 0;
         static std::chrono::steady_clock::time_point t0;
@@ -290,6 +372,7 @@ void after_execute(Cpu* c, uint32_t execute_fn) {
         uint32_t saved[sizeof kTrigWords / sizeof *kTrigWords];
         bool cleared = false;
         for (int i = 0; i < kDoorExtra && door; i++) {
+            const StepParts& kStep = kDoorStep;  // the extra step's parts (turbo_steps.h)
             if (const WeatherEffect* w = kDoorWeatherWait ? weather_teardown() : nullptr) {
                 trace("extra steps wait: %s packet tearing down (phase %u)", w->name, ld8(kEnvLight + w->phase_off));
                 break;
@@ -311,7 +394,7 @@ void after_execute(Cpu* c, uint32_t execute_fn) {
             call(c, f_025E0EE4_orig, 0);  // fpcPi_Handler
             call(c, f_025DDCEC_orig, 0);  // fpcCt_Handler
             g_door_cut = false;
-            call(c, f_025DE788_orig, execute_fn);
+            if (kStep.execute) call(c, f_025DE788_orig, execute_fn);
             g_extra_door++;
             door = g_door_cut;  // continue only while the door event still runs
             g_door_cut = false;

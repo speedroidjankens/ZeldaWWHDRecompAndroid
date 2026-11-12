@@ -272,6 +272,8 @@
     <string name="opt_import_hint">Restore them from their files; an imported game save restarts the game</string>
     <string name="opt_interp">Frame rate</string>
     <string name="opt_interp_hint">Frame interpolation: in-between frames from the game\'s 30 fps. Needs a fast CPU; where a frame doesn\'t fit in time it is left out and the game keeps its speed. 60 fps (generated): every other frame is made on the GPU from the last one, light on the CPU</string>
+    <string name="opt_tick_speed">Tick speed</string>
+    <string name="opt_tick_speed_hint">Whole-game fast forward: the game runs 1 to 9 ticks per real second. 1x is normal speed. Only one digit (up to 9x) so it can\'t be set to 99x by accident. If the phone can\'t keep up it just runs as fast as it can</string>
     <string name="opt_invert_camera_y">Invert camera up/down</string>
     <string name="opt_invert_camera_y_hint">Flips up and down on the right stick (and swipe). In first person and aiming the game itself already looks down when you push up: for up = look down everywhere, choose Normal camera only. Conducting the Wind Waker is never flipped</string>
     <string name="opt_item_ring">Item ring</string>

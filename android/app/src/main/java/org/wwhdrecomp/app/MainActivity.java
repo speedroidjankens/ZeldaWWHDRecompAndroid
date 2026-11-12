@@ -212,6 +212,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         }
         instance = this;
         prefs = getSharedPreferences("settings", MODE_PRIVATE);
+        firstStartDefaults();
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().getAttributes().layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
         // edge to edge on every Android version, as Android 15+ does anyway for targetSdk 35+ (issue #29: on Android 14
@@ -255,6 +256,9 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             if (interp != 0 && !Benchmark.pending(prefs)) setenv("WWHD_INTERP_FPS", String.valueOf(interp));
             // 60 fps (generated): in-between frames made on the GPU (vk/reproj.cpp); goes before LSFG
             if (prefs.getBoolean("fps_generated", false) && !Benchmark.pending(prefs)) setenv("WWHD_FPS_GENERATED", "1");
+            // tick speed (this fork): whole-game fast forward, 1-9x (1 = normal)
+            int tickSpeed = prefs.getInt("tick_speed", 1);
+            if (tickSpeed > 1 && !Benchmark.pending(prefs)) setenv("WWHD_TICK_SPEED", String.valueOf(tickSpeed));
             // little RAM (4 GB devices report ~3.6-3.8 GB): no shader pipelines made ahead, a budget for them (vk_draw.cpp)
             if (GraphicsPresets.ramMb(this) < LOW_MEMORY_MB) setenv("WWHD_LOW_MEMORY", "1");
             // under ~3.5 GB (3 GB TV boxes; 4 GB phones report 3.6-3.8): no shader head start at all. It translated
@@ -318,6 +322,11 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     }
 
     String gameLanguage() {
+        Object old = prefs.getAll().get("language");
+        if (old instanceof Integer) {  // earlier builds of this fork: a Cafe OS language code
+            int c = (Integer) old;
+            prefs.edit().putString("language", c == 5 ? "es" : c == 2 ? "fr" : c == 3 ? "de" : c == 4 ? "it" : "en").commit();
+        }
         String l = prefs.getString("language", "");
         if (l.isEmpty()) l = java.util.Locale.getDefault().getLanguage();
         for (String s : LANGUAGES)
@@ -1699,8 +1708,45 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
     }
 
+    // first start without a controller attached: set up for a single touch screen (GamePad controls,
+    // the hybrid layout: touch menus full screen); with a controller the usual defaults stay
+    private void firstStartDefaults() {
+        if (prefs.getBoolean("defaults_set", false)) return;
+        SharedPreferences.Editor e = prefs.edit().putBoolean("defaults_set", true);
+        if (!prefs.contains("layout") && !controllerAttached()) {
+            e.putInt("layout", LAYOUT_HYBRID);
+            if (!prefs.contains("pro_controller")) e.putBoolean("pro_controller", false);
+        }
+        e.apply();
+    }
+
+    private static boolean controllerAttached() {
+        for (int id : InputDevice.getDeviceIds()) {
+            InputDevice d = InputDevice.getDevice(id);
+            if (d != null && !d.isVirtual() && InputMapper.isController(d)) return true;
+        }
+        return false;
+    }
+
+    // a controller in use went away: back to touch (controls shown, this device's sensors and rumble)
+    private final android.hardware.input.InputManager.InputDeviceListener deviceListener =
+            new android.hardware.input.InputManager.InputDeviceListener() {
+        @Override public void onInputDeviceAdded(int id) {}
+        @Override public void onInputDeviceChanged(int id) {}
+        @Override public void onInputDeviceRemoved(int id) {
+            if (lastController == null || lastController.getId() != id) return;
+            inputSource(null);
+            if (autoHidden) {
+                autoHidden = false;
+                applyControlsAppearance();
+            }
+        }
+    };
+
     private void applyOptions() {
         Native.setOption("ao_mode", prefs.getInt("ao_mode", Native.getOption("ao_mode")));
+        Native.setOption("bloom_strength", prefs.getInt("bloom_strength", 100));
+        Native.setOption("area_blur", prefs.getBoolean("area_blur", false) ? 1 : 0);
         Native.setOption("ao_hires", prefs.getBoolean("ao_hires", Native.getOption("ao_hires") != 0) ? 1 : 0);
         Native.setOption("area_blur", prefs.getBoolean("area_blur", Native.getOption("area_blur") != 0) ? 1 : 0);
         Native.setOption("aniso", prefs.getBoolean("aniso", Native.getOption("aniso") != 0) ? 1 : 0);
@@ -2094,6 +2140,10 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             case LAYOUT_DRC_LARGE:
                 drc = full;
                 tv = inset;
+                break;
+            case LAYOUT_HYBRID:  // the GamePad is drawn over the TV
+                tv = full;
+                drc = hybridMenu ? full : null;
                 break;
             default:
                 tv = full;
@@ -3065,6 +3115,23 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     }
 
     @Override
+    public void onLayoutSaved(String layout) {
+        prefs.edit().putString("touch_layout", layout).apply();
+    }
+
+    void recalibrateGyro() {
+        Native.motionReset();
+        info(getString(R.string.gyro_recalibrated));
+    }
+
+    /** the layout editor over the game (from the options menu) */
+    void editTouchLayout() {
+        if (controls == null) return;
+        if (!prefs.getBoolean("controls_visible", true)) setControlsVisible(true);
+        controls.setEditMode(true);
+    }
+
+    @Override
     public void onOverlayMoved(float fx, float fy) {
         prefs.edit().putFloat("perf_x", fx).putFloat("perf_y", fy).apply();
     }
@@ -3267,7 +3334,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     // depth, N anisotropic filtering, P capture
     private boolean hotkey(int code) {
         switch (code) {
-            case KeyEvent.KEYCODE_O: setAo((Native.getOption("ao_mode") + 1) % 3); return true;
+            case KeyEvent.KEYCODE_O: setAo((Native.getOption("ao_mode") + 1) % 4); return true;
             case KeyEvent.KEYCODE_M: setBool("ao_hires", Native.getOption("ao_hires") == 0); return true;
             case KeyEvent.KEYCODE_N: setBool("aniso", Native.getOption("aniso") == 0); return true;
             case KeyEvent.KEYCODE_P: case KeyEvent.KEYCODE_F12: Native.setOption("capture", 1); return true;
@@ -3316,6 +3383,8 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         if (benchRunning) Benchmark.interrupted();
         updateDrcDisplay();
         if (started) Native.setPaused(true);
+        // the game's controller select screen may have switched the controls (hle/padscore.cpp)
+        if (started) prefs.edit().putBoolean("pro_controller", Native.getOption("pro_controller") != 0).apply();
         if (motion != null) motion.stop();
         if (rumble != null) rumble.stop();
     }
@@ -3324,6 +3393,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     protected void onResume() {
         super.onResume();
         resumed = true;
+        ((android.hardware.input.InputManager) getSystemService(INPUT_SERVICE)).registerInputDeviceListener(deviceListener, null);
         updateDrcDisplay();
         if (started) {
             Native.setPaused(false);
@@ -3509,6 +3579,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     }
 
     // ---- actions of the in-game menu (OptionsMenu)
+    static final float[] CAMERA_SENSITIVITIES = {0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f};
     static final float[] CONTROL_SIZES = {0.75f, 0.9f, 1f, 1.15f, 1.3f};
     // swipe speed factors 0.25 to 4 in steps of 0.25, shown relative to the default 2: -175 to +200
     static final float[] SWIPE_SPEEDS = new float[16];
@@ -4380,6 +4451,24 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         Native.setOption("fps_generated", 1);
     }
 
+    // the display's highest refresh rate (at least 60)
+    int maxRefreshHz() {
+        float hz = 60;
+        for (android.view.Display.Mode m : getWindowManager().getDefaultDisplay().getSupportedModes())
+            hz = Math.max(hz, m.getRefreshRate());
+        return Math.round(hz);
+    }
+
+    // frames shown per second without frame generation (the Frame rate setting)
+    int shownFps() {
+        switch (prefs.getBoolean("fg_enabled", false) ? 0 : savedFpsMode()) {
+            case 1: case 2: case 3: return 60;
+            case 4: return 40;
+            case 5: return 120;
+            default: return 30;
+        }
+    }
+
     private void applyFrameGenSettings() {
         // the renderer generates frames only if the display can show them (also when switched on later)
         float hz = 60;
@@ -4444,6 +4533,39 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             Native.setFrameGenRiskAccepted(false);
         }
         frameGenChanged();
+    }
+
+    /** 40 and 120 fps need a panel that runs at 120 Hz (40 fps: a frame every 3 refreshes) */
+    boolean has120Hz() {
+        for (android.view.Display.Mode m : getWindowManager().getDefaultDisplay().getSupportedModes())
+            if (Math.abs(m.getRefreshRate() - 120f) < 1.5f) return true;
+        return false;
+    }
+
+    /**
+     * the saved frame rate mode (fps60.cpp): 0 30 fps, 1 60 fps (frame interpolation, paced), 3 true
+     * 60, 4 40 fps, 5 120 fps; 2 (adaptive 60 of older versions) is 60 now, and 40/120 fps fall back
+     * to 60 where the panel has no 120 Hz
+     */
+    int savedFpsMode() {
+        int m = prefs.getInt("fps_mode", 0);
+        return m == 2 || ((m == 4 || m == 5) && !has120Hz()) ? 1 : m;
+    }
+
+    String fpsModeName(int m) {
+        String[] names = getResources().getStringArray(R.array.fps_modes);
+        if (m == 4) return getString(R.string.fps_40);
+        if (m == 5) return getString(R.string.fps_120);
+        return names[Math.min(m, names.length - 1)];
+    }
+
+    void setFpsMode(int m) {
+        prefs.edit().putInt("fps_mode", m).commit();
+        if (m != 0 && prefs.getBoolean("fg_enabled", false)) {
+            prefs.edit().putBoolean("fg_enabled", false).commit();
+            frameGenChanged();
+        }
+        Native.setOption("fps_mode", m);
     }
 
     // applied while the game runs (the renderer rebuilds the network at its next frame)
@@ -4859,7 +4981,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         }, "backup").start();
     }
 
-    private void info(String msg) {
+    void info(String msg) {
         new GameDialog(this).title(R.string.backup_title).message(msg).button(R.string.opt_ok, null).show();
     }
 

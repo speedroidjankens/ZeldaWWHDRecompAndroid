@@ -3,6 +3,7 @@
 #include <bitset>
 #include "Cafe/HW/Latte/Renderer/RendererShader.h"
 #include <boost/container/static_vector.hpp>
+#include <bitset>
 
 namespace LatteDecompiler
 {

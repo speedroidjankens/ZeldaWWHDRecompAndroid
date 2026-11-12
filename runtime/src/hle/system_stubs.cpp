@@ -1,5 +1,9 @@
 // Libraries the game uses for system integration and online features.
 // Online services (Miiverse, SpotPass, accounts) report "unavailable".
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+
 #include "../runtime.h"
 #include "../input.h"
 #include "../motion.h"
@@ -45,6 +49,17 @@ HLE(nn_olv, Initialize__Q2_2nn3olvFPCQ3_2nn3olv15InitializeParam) { ret(c, kResu
 HLE(nn_olv, IsInitialized__Q2_2nn3olvFv) { ret(c, 0); }
 HLE(nn_olv, Finalize__Q2_2nn3olvFv) { ret(c, kResultOk); }
 
+// OliveOperationMgrThread (Miiverse requests: Tingle Bottles, posts, Yeahs) runs a state machine that
+// re-posts itself to its own message queue until Miiverse answers, which it never does here: about
+// 100k steps a second, a whole host core and its emulated core (on the console it only soaks up idle
+// time on its core). A 1 ms nap per step (releasing the guest core) keeps it to ~1000 steps a second.
+// (From the original project, 812ef67.)
+extern "C" void f_0203DEEC_orig(Cpu* c);
+extern "C" void hook_0203DEEC(Cpu* c) {
+    threads::park_sleep_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(1));
+    f_0203DEEC_orig(c);
+}
+
 // ---- sockets / curl
 HLE(nsysnet, socket_lib_init) { ret(c, 0); }
 HLE(nsysnet, socket_lib_finish) { ret(c, 0); }
@@ -88,15 +103,17 @@ HLE(vpad, VPADRead) {
     // frame interpolation: the read after a logic pass repeats the last sample (interp.cpp)
     static input::PadState last_p;
     const bool repeat = interp::repeat_input();
-    input::PadState p = repeat ? last_p : input::read();
-    if (repeat && interp::fresh_sticks()) {  // true 60: sticks every pass, buttons on full passes
-        input::PadState f = input::read();
+    // in Pro Controller mode the buttons go to KPADReadEx: don't spend its short taps here
+    input::PadState p = repeat ? last_p : input::read(!input::pro_controller());
+    if (repeat && interp::fresh_sticks()) {  // sticks every pass, buttons on full passes
+        input::PadState f = input::read(false);
         p.lx = f.lx; p.ly = f.ly; p.rx = f.rx; p.ry = f.ry;
     }
     last_p = p;
-    if (input::pro_controller()) {  // GamePad on the table: screen and touch only
+    if (input::pro_controller()) {  // GamePad on the table: screen only (stray touches make the game buzz and lock the pause menu)
         p.buttons = 0;
         p.lx = p.ly = p.rx = p.ry = 0;
+        p.touch = false;
     }
     uint32_t hold = p.buttons;
     auto stick_dirs = [&](float x, float y, uint32_t up, uint32_t down, uint32_t left, uint32_t right) {

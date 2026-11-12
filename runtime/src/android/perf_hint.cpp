@@ -1,0 +1,140 @@
+// ADPF performance hints (Android 13+): each frame reports how much CPU time the game and render
+// threads needed against the frame budget, so the governor picks the lowest clocks that hold the
+// frame rate instead of boosting blindly and throttling once the device is hot.
+// The API is resolved at run time (the app supports Android 11). WWHD_NO_ADPF=1 disables it.
+#include "perf_hint.h"
+
+#include <dlfcn.h>
+#include <pthread.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstdlib>
+#include <ctime>
+
+#include "../runtime.h"
+
+namespace interp { int vsync_rate(); }  // interp.cpp: the guest vsync clock's speed
+
+namespace perf_hint {
+namespace {
+struct Manager;
+struct Session;
+Manager* (*p_getManager)();
+Session* (*p_createSession)(Manager*, const int32_t*, size_t, int64_t);
+int (*p_updateTarget)(Session*, int64_t);
+int (*p_report)(Session*, int64_t);
+void (*p_close)(Session*);
+
+std::atomic<bool> g_render_set{false};
+pthread_t g_render_thread;
+std::atomic<int32_t> g_render_tid{0};
+std::atomic<bool> g_record_set{false};
+pthread_t g_record_thread;
+std::atomic<int32_t> g_record_tid{0};
+
+bool load() {
+    if (getenv("WWHD_NO_ADPF")) return false;
+    void* lib = dlopen("libandroid.so", RTLD_NOW);
+    if (!lib) return false;
+    p_getManager = (decltype(p_getManager))dlsym(lib, "APerformanceHint_getManager");
+    p_createSession = (decltype(p_createSession))dlsym(lib, "APerformanceHint_createSession");
+    p_updateTarget = (decltype(p_updateTarget))dlsym(lib, "APerformanceHint_updateTargetWorkDuration");
+    p_report = (decltype(p_report))dlsym(lib, "APerformanceHint_reportActualWorkDuration");
+    p_close = (decltype(p_close))dlsym(lib, "APerformanceHint_closeSession");
+    return p_getManager && p_createSession && p_updateTarget && p_report && p_close;
+}
+
+int64_t cpu_ns(clockid_t clk) {
+    timespec ts{};
+    if (clock_gettime(clk, &ts) != 0) return 0;
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+}  // namespace
+
+void register_render_thread() {
+    g_render_thread = pthread_self();
+    g_render_tid = (int32_t)syscall(SYS_gettid);
+    g_render_set = true;
+}
+
+void register_record_thread() {
+    g_record_thread = pthread_self();
+    g_record_tid = (int32_t)syscall(SYS_gettid);
+    g_record_set = true;
+}
+
+// CPU time per swap of the game and render threads, smoothed (also without ADPF)
+std::atomic<int64_t> g_game_avg{0}, g_render_avg{0}, g_record_avg{0};
+
+void recent_work(int64_t& game_ns, int64_t& render_ns) {
+    game_ns = g_game_avg.load(std::memory_order_relaxed);
+    render_ns = g_render_avg.load(std::memory_order_relaxed);
+}
+
+void recent_work(int64_t& game_ns, int64_t& render_ns, int64_t& record_ns) {
+    recent_work(game_ns, render_ns);
+    record_ns = g_record_avg.load(std::memory_order_relaxed);
+}
+
+void on_swap(uint32_t swap_interval) {
+    static const bool available = load();
+    static int64_t last_game = 0, last_render = 0, last_record = 0;
+    static int32_t last_game_tid = 0;
+    // the busier of the two threads is the frame's critical path; their CPU time excludes waits
+    const int32_t game = (int32_t)syscall(SYS_gettid);
+    int64_t g = cpu_ns(CLOCK_THREAD_CPUTIME_ID), r = 0, c = 0;
+    clockid_t rclk;
+    if (g_render_set && pthread_getcpuclockid(g_render_thread, &rclk) == 0) r = cpu_ns(rclk);
+    if (g_record_set && pthread_getcpuclockid(g_record_thread, &rclk) == 0) c = cpu_ns(rclk);
+    int64_t dg = last_game && game == last_game_tid ? g - last_game : 0, dr = last_render ? r - last_render : 0,
+            dc = last_record ? c - last_record : 0;
+    last_game = g;
+    last_render = r;
+    last_record = c;
+    last_game_tid = game;
+    if (dg > 0 && dg < 1000000000) g_game_avg = g_game_avg.load() ? (g_game_avg.load() * 7 + dg) / 8 : dg;
+    if (dr > 0 && dr < 1000000000) g_render_avg = g_render_avg.load() ? (g_render_avg.load() * 7 + dr) / 8 : dr;
+    if (dc > 0 && dc < 1000000000) g_record_avg = g_record_avg.load() ? (g_record_avg.load() * 7 + dc) / 8 : dc;
+
+    if (!available) return;
+    static Manager* mgr = p_getManager();
+    static Session* session = nullptr;
+    static int32_t session_game = 0, session_render = 0, session_record = 0;
+    static int64_t target = 0;
+    static bool failed = false;
+    if (!mgr || failed) return;
+    const int32_t render = g_render_tid;
+    const int32_t record = g_record_tid;
+    // vsyncs at 59.94 Hz (at 40 and 120 fps the guest vsync clock runs at 120 Hz: interp.cpp)
+    int64_t want = (int64_t)std::max<uint32_t>(swap_interval, 1) * (16683333 / std::max(1, interp::vsync_rate()));
+    if (!session || game != session_game || render != session_render || record != session_record) {
+        if (session) p_close(session);
+        int32_t tids[3] = {game, render, record};
+        size_t count = 1;
+        if (render && render != game) tids[count++] = render;
+        if (record && record != game && record != render) tids[count++] = record;
+        session = p_createSession(mgr, tids, count, want);
+        if (!session) {
+            failed = true;
+            LOG("[adpf] no performance hint session");
+            return;
+        }
+        LOG("[adpf] session for game thread %d, render thread %d, record thread %d, target %.1f ms", game, render, record, want / 1e6);
+        session_game = game;
+        session_render = render;
+        session_record = record;
+        target = want;
+        return;
+    }
+    if (want != target) {
+        p_updateTarget(session, want);
+        target = want;
+    }
+    int64_t work = std::max({dg, dr, dc});
+    if (work > 0) p_report(session, work);
+}
+}  // namespace perf_hint

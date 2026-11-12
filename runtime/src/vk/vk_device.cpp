@@ -20,6 +20,7 @@
 #include <thread>
 
 #include "gx2/gx2.h"
+#include "android/perf_hint.h"
 #include "lsfg.h"
 #include "reproj.h"
 #include "platform.h"
@@ -28,6 +29,7 @@
 #include "vk.h"
 #include "vk_window.h"
 #include "../aspect.h"
+namespace interp { bool mode40(); }  // interp.cpp: 40 fps needs the panel at 120 Hz
 
 namespace gfx {
 Renderer R;
@@ -552,7 +554,9 @@ void end_pass() {
         prof_pass_end();
         R.pass = VK_NULL_HANDLE;
         // submit work in chunks so the GPU starts while the frame is still being built (like the
-        // hardware command processor), instead of all at once on swap
+        // hardware command processor), instead of all at once on swap. The flicker of the distant
+        // shading it seemed to cause was dynamic state inherited across command buffers (fixed in
+        // record_draw's pass state). WWHD_NO_CHUNK=1: one submission per frame.
         static const bool chunked = getenv("WWHD_NO_CHUNK") == nullptr;
         if (chunked && g_draws_since_commit_ >= 1024) submit();
     }
@@ -1108,7 +1112,10 @@ struct Swapchain {
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkSwapchainKHR sc = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
-    VkExtent2D extent{};
+    VkExtent2D extent{};  // the window's size in its current orientation (layout coordinates)
+    VkExtent2D phys{};    // the images' size: the extent in the display's native orientation
+    uint32_t rot = 0;     // quarter turns the present pass applies (pre-transform)
+    VkSurfaceTransformFlagBitsKHR transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     std::vector<VkImage> images;
     std::vector<VkImageView> views;
     std::vector<VkFramebuffer> fbs;
@@ -1235,6 +1242,53 @@ void destroy_swapchain(Swapchain& sc, bool keepSurface) {
     }
 }
 
+// rotate in the present pass (see ensure_swapchain); WWHD_NO_PRETRANSFORM=1 leaves it to the compositor
+const bool g_pretransform = getenv("WWHD_NO_PRETRANSFORM") == nullptr;
+
+// API 30's entry point only changes refresh rate when the transition is seamless. ColorOS can
+// otherwise engage FRTC at an intermediate rate (55 Hz was observed while 60 Hz was requested).
+// Resolve the API 31 entry point at runtime because the app still supports Android 11.
+void request_window_frame_rate(ANativeWindow* window, float hz, int8_t compatibility) {
+    using SetWithStrategy = int32_t (*)(ANativeWindow*, float, int8_t, int8_t);
+    static auto setWithStrategy = reinterpret_cast<SetWithStrategy>(
+        dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRateWithChangeStrategy"));
+    int32_t r;
+    if (setWithStrategy && !getenv("WWHD_FRAME_RATE_SEAMLESS"))
+        r = setWithStrategy(window, hz, compatibility, int8_t{1});  // CHANGE_FRAME_RATE_ALWAYS (API 31)
+    else
+        r = ANativeWindow_setFrameRate(window, hz, compatibility);
+    if (r) LOG("[vk] window frame-rate request %.1f Hz failed: %d", hz, r);
+}
+// The display rate the window asks for, from the frames shown per second (30, or what frame
+// interpolation draws: interp::frames_per_step). Frame generation presents a steady multiple of it
+// (a 144 Hz panel can't space 60 or 120 fps evenly; 120 Hz can); without it at least 60 Hz, more for
+// interpolation at 120 fps. Checked every frame (the frame rate setting changes during play); Android
+// is asked only when it changes, or for a new window (force).
+static bool no_60hz_request() {
+    static const bool off = getenv("WWHD_NO_60HZ") != nullptr;
+    return off;
+}
+static float g_rate_requested = -1.0f;
+static void request_display_rate(ANativeWindow* window, bool force) {
+    if (!window) return;
+    const int shown = 30 * interp::frames_per_step();
+    float rate;
+    int8_t compat = ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT;
+    if (fg::loaded()) {
+        rate = (float)(shown * fg::config().multiplier);
+        compat = ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE;
+    } else {
+        // without it the game flips at most 60 times a second (more with interpolation): let a 90/120 Hz
+        // panel drop to 60 Hz (from pull request #8 by SSunnKing, 62a723b); WWHD_NO_60HZ=1 leaves it alone
+        rate = no_60hz_request() ? 0.0f : (float)std::max(60, shown);
+        if (interp::mode40()) rate = 120.0f;  // 40 fps: a frame every 3 refreshes of a 120 Hz panel
+    }
+    if (!force && rate == g_rate_requested) return;
+    g_rate_requested = rate;
+    request_window_frame_rate(window, rate, compat);
+    LOG("[vk] display rate requested: %.0f Hz%s", rate, fg::loaded() ? " (frame generation)" : "");
+}
+
 // g_window_mutex held; true if a swapchain is ready. `main`: the game window (frame generation
 static bool no_60hz_request() {
     static const bool off = getenv("WWHD_NO_60HZ") != nullptr;
@@ -1309,7 +1363,7 @@ bool ensure_swapchain(Swapchain& sc, bool main = true) {
             fmt = f;
             break;
         }
-    // the window's size in its current orientation; the compositor applies any rotation
+    // the window's size in its current orientation (layout coordinates; the images may be rotated)
     VkExtent2D ext{(uint32_t)ANativeWindow_getWidth(sc.window), (uint32_t)ANativeWindow_getHeight(sc.window)};
     if (!ext.width || !ext.height) return false;
     vkGetPhysicalDeviceSurfacePresentModesKHR(R.pd, sc.surface, &n, nullptr);
@@ -1327,12 +1381,22 @@ bool ensure_swapchain(Swapchain& sc, bool main = true) {
     if (caps.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
     ci.imageFormat = fmt.format;
     ci.imageColorSpace = fmt.colorSpace;
-    ci.imageExtent = ext;
+    // rotate in the present pass instead of letting the compositor rotate every frame
+    // (often an extra GPU pass); WWHD_NO_PRETRANSFORM=1 restores the compositor rotation
+    uint32_t rot = 0;
+    if (g_pretransform && main) {  // the GamePad display: left to the compositor
+        if (caps.currentTransform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR) rot = 1;
+        else if (caps.currentTransform == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR) rot = 2;
+        else if (caps.currentTransform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) rot = 3;
+    }
+    VkExtent2D phys = rot & 1 ? VkExtent2D{ext.height, ext.width} : ext;
+    ci.imageExtent = phys;
     ci.imageArrayLayers = 1;
     ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    ci.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
-                                                                                        : caps.currentTransform;
+    ci.preTransform = rot ? caps.currentTransform
+                          : (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+                                                                                                : caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;  // Android often offers only INHERIT
     for (VkCompositeAlphaFlagBitsKHR a : {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
                                           VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR})
@@ -1377,6 +1441,9 @@ bool ensure_swapchain(Swapchain& sc, bool main = true) {
         sc.format = fmt.format;
     }
     sc.extent = ext;
+    sc.phys = phys;
+    sc.rot = rot;
+    sc.transform = caps.currentTransform;
     vkGetSwapchainImagesKHR(R.device, sc.sc, &n, nullptr);
     sc.images.resize(n);
     vkGetSwapchainImagesKHR(R.device, sc.sc, &n, sc.images.data());
@@ -1393,8 +1460,8 @@ bool ensure_swapchain(Swapchain& sc, bool main = true) {
         fi.renderPass = sc.pass;
         fi.attachmentCount = 1;
         fi.pAttachments = &v;
-        fi.width = ext.width;
-        fi.height = ext.height;
+        fi.width = phys.width;
+        fi.height = phys.height;
         fi.layers = 1;
         VkFramebuffer fb;
         VK_CHECK(vkCreateFramebuffer(R.device, &fi, nullptr, &fb));
@@ -1457,6 +1524,7 @@ void draw_screen(VkCommandBuffer cmd, Screen& scr, const ScreenRect& r, VkExtent
             int32_t x1 = std::min((int32_t)ext.width, (int32_t)(r.x + r.w)), y1 = std::min((int32_t)ext.height, (int32_t)(r.y + r.h));
             sc = {{x0, y0}, {(uint32_t)std::max(0, x1 - x0), (uint32_t)std::max(0, y1 - y0)}};
         }
+        sc = rotate_rect(sc, ext, rot);
         vkCmdSetScissor(cmd, 0, 1, &sc);
     }
     pc[4] = scr.srgb ? 1.0f : 0.0f;
@@ -1476,9 +1544,20 @@ void draw_screen(VkCommandBuffer cmd, Screen& scr, const ScreenRect& r, VkExtent
     vkCmdPushConstants(cmd, g_present_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
     vkCmdDraw(cmd, 4, 1, 0, 0);
     if (mode == 2) {
-        VkRect2D full{{0, 0}, ext};
+        VkRect2D full = rotate_rect({{0, 0}, ext}, ext, rot);
         vkCmdSetScissor(cmd, 0, 1, &full);
     }
+}
+
+// SUBOPTIMAL: recreate when the window size or the display rotation changed (g_window_mutex held)
+bool swapchain_changed() {
+    if ((uint32_t)ANativeWindow_getWidth(g_sc.window) != g_sc.extent.width ||
+        (uint32_t)ANativeWindow_getHeight(g_sc.window) != g_sc.extent.height)
+        return true;
+    if (!g_pretransform) return false;  // the compositor rotates: SUBOPTIMAL is expected
+    VkSurfaceCapabilitiesKHR caps{};
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(R.pd, g_sc.surface, &caps);
+    return caps.currentTransform != g_sc.transform;
 }
 
 // performance overlay: frames presented (game frames, or with frame generation all presented frames)
@@ -1518,9 +1597,8 @@ bool present_frame() {
         return false;
     }
     // SUBOPTIMAL is normal on Android when the compositor rotates the image (identity pre-transform):
-    // recreate only when the window size changed
-    if (r == VK_SUBOPTIMAL_KHR && ((uint32_t)ANativeWindow_getWidth(g_sc.window) != g_sc.extent.width ||
-                                   (uint32_t)ANativeWindow_getHeight(g_sc.window) != g_sc.extent.height))
+    // recreate only when the window size or the display rotation changed
+    if (r == VK_SUBOPTIMAL_KHR && swapchain_changed())
         g_sc.stale = true;
     if (R.tv.img.image) prepare(R.tv.img, Use::SAMPLED);
     if (R.drc.img.image) prepare(R.drc.img, Use::SAMPLED);
@@ -1531,12 +1609,12 @@ bool present_frame() {
     VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     bi.renderPass = g_sc.pass;
     bi.framebuffer = g_sc.fbs[idx];
-    bi.renderArea = {{0, 0}, g_sc.extent};
+    bi.renderArea = {{0, 0}, g_sc.phys};
     bi.clearValueCount = 1;
     bi.pClearValues = &clear;
     vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
-    VkViewport vp{0, 0, (float)g_sc.extent.width, (float)g_sc.extent.height, 0, 1};
-    VkRect2D sc{{0, 0}, g_sc.extent};
+    VkViewport vp{0, 0, (float)g_sc.phys.width, (float)g_sc.phys.height, 0, 1};
+    VkRect2D sc{{0, 0}, g_sc.phys};
     vkCmdSetViewport(cmd, 0, 1, &vp);
     vkCmdSetScissor(cmd, 0, 1, &sc);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_sc.pipeline);
@@ -1773,8 +1851,7 @@ bool fg_present(const Image* img) {
         if (r != VK_TIMEOUT && r != VK_NOT_READY) g_sc.stale = true;
         return false;
     }
-    if (r == VK_SUBOPTIMAL_KHR && ((uint32_t)ANativeWindow_getWidth(g_sc.window) != g_sc.extent.width ||
-                                   (uint32_t)ANativeWindow_getHeight(g_sc.window) != g_sc.extent.height))
+    if (r == VK_SUBOPTIMAL_KHR && swapchain_changed())
         g_sc.stale = true;
     g_fg_next = (g_fg_next + 1) % 3;
     vkResetFences(R.device, 1, &ps.fence);
@@ -1811,16 +1888,16 @@ bool fg_present(const Image* img) {
     VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rb.renderPass = g_sc.pass;
     rb.framebuffer = g_sc.fbs[idx];
-    rb.renderArea = {{0, 0}, g_sc.extent};
+    rb.renderArea = {{0, 0}, g_sc.phys};
     rb.clearValueCount = 1;
     rb.pClearValues = &clear;
     vkCmdBeginRenderPass(cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
-    VkViewport vp{0, 0, (float)g_sc.extent.width, (float)g_sc.extent.height, 0, 1};
-    VkRect2D sc{{0, 0}, g_sc.extent};
+    VkViewport vp{0, 0, (float)g_sc.phys.width, (float)g_sc.phys.height, 0, 1};
+    VkRect2D sc{{0, 0}, g_sc.phys};
     vkCmdSetViewport(cmd, 0, 1, &vp);
     vkCmdSetScissor(cmd, 0, 1, &sc);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_sc.pipeline);
-    float pc[8] = {0, 0, 1, 1, 0, 0, 0, 0};  // the whole window; already display encoded
+    float pc[8] = {0, 0, 1, 1, 0, (float)g_sc.rot, 0, 0};  // the whole window; already display encoded
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_present_layout, 0, 1, &set, 0, nullptr);
     vkCmdPushConstants(cmd, g_present_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
     vkCmdDraw(cmd, 4, 1, 0, 0);
@@ -2643,6 +2720,7 @@ static std::atomic<uint64_t> g_frames_completed{0}, g_frames_submitted{0};
 // GPU so the game can reuse the frame's buffers; this renderer has copied all guest data by the time
 // a frame is submitted, so a submitted frame counts, as long as the GPU is at most one frame behind.
 // The CPU then builds frame N+1 while the GPU renders frame N (WWHD_STRICT_FLIPS=1: wait for the GPU).
+uint64_t frames_submitted() { return g_frames_submitted.load(); }
 uint64_t frames_completed() {
     static const bool strict = getenv("WWHD_STRICT_FLIPS") != nullptr;
     uint64_t done = g_frames_completed.load();

@@ -17,6 +17,11 @@
 #include "gx2_texture_regs.h"
 #include "platform.h"
 #include "runtime.h"
+#ifdef __ANDROID__
+#include "android/display_vsync.h"
+#include "android/fps60.h"
+#include "android/perf_hint.h"
+#endif
 #include "../aspect.h"
 #include <map>
 #include <unistd.h>
@@ -305,9 +310,8 @@ static void enqueue2(Op op, bool hasHead, uint32 head, const uint32* payload, ui
 }
 static void enqueue(Op op, const uint32* payload, uint32 n) { enqueue2(op, false, 0, payload, n); }
 
-// block the game thread until the render thread has executed everything queued so far
-static void render_sync() {
-    if (!g_render_thread) return;
+// a fence after everything queued so far, and waiting for the render thread to reach one
+static uint64_t issue_fence() {
     uint64_t id;
     {
         std::lock_guard<std::mutex> lk(g_q_mutex);
@@ -316,8 +320,18 @@ static void render_sync() {
     }
     uint32 w = (uint32)id;
     enqueue(OP_FENCE, &w, 1);
+    return id;
+}
+static void wait_fence(uint64_t id) {
     std::unique_lock<std::mutex> lk(g_q_mutex);
     g_q_done_cv.wait(lk, [&] { return g_fence_done >= id; });
+}
+
+// block the game thread until the render thread has executed everything queued so far
+// (merge fix: from Enhanced's gx2_core.cpp; Modern used render_sync() but never defined it)
+static void render_sync() {
+    if (!g_render_thread) return;
+    wait_fence(issue_fence());
 }
 
 // one command made of a head word (if hasHead) and a payload: written straight into the display
@@ -580,13 +594,34 @@ using namespace gx2;
 static uint64_t g_swap_count = 0, g_flip_count = 0;
 namespace gx2 { uint64_t flips_presented() { return __atomic_load_n(&g_flip_count, __ATOMIC_RELAXED); } }  // live fps in the title
 static uint32 g_swap_interval = 1;  // as set by the game (frame interpolation halves it)
-namespace interp { uint32_t effective_swap_interval(uint32_t game); }
+namespace interp { uint32_t effective_swap_interval(uint32_t game); int vsync_rate(); }
 static std::mutex g_flip_mutex;
-static const auto g_vsync_epoch = std::chrono::steady_clock::now();
-static constexpr std::chrono::nanoseconds kVsyncPeriod(16683333);  // 59.94 Hz
+static constexpr int64_t kVsyncPeriod = 16683333;  // ns, 59.94 Hz
+// The guest vsync clock: index = base_index + (now - base_ns) / period. It runs free at 59.94 Hz;
+// on Android it locks to the display's vsync when the panel runs at a multiple of ~60 Hz
+// (gx2_display_vsync), so flips land on display refreshes instead of drifting against them
+// (a repeated or skipped frame every few seconds). WWHD_NO_VSYNC_LOCK=1 keeps it free running.
+static std::mutex g_vclock_mutex;
+static int64_t g_vclock_base_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+static uint64_t g_vclock_base_index = 0, g_vclock_last = 0;
+static int64_t g_vclock_period = kVsyncPeriod;
+// fast forward (mods/turbo.cpp): the clock runs g_vclock_rate times as fast, so the game flips more
+// often and plays more frames per second, every one calculated and drawn as usual
+static double g_vclock_rate = 1.0;
+static int64_t vclock_period() { return g_vclock_rate == 1.0 ? g_vclock_period : (int64_t)(g_vclock_period / g_vclock_rate); }
+static int64_t steady_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static uint64_t vclock_index(int64_t t) {  // g_vclock_mutex held
+    int64_t d = t - g_vclock_base_ns;
+    uint64_t i = g_vclock_base_index + (d > 0 ? (uint64_t)(d / vclock_period()) : 0);
+    return g_vclock_last = std::max(i, g_vclock_last);  // re-phasing never moves it back
+}
 // a flip also waits for the GPU to finish that frame, as on hardware: the game reuses a frame's
 // buffers once its flip has executed
-struct PendingFlip { uint64_t vsync, swap; };
+struct PendingFlip { uint64_t vsync, swap; uint8_t waitedRender = 0, waitedGpu = 0; };
+// pacing diagnostics: why flips missed the vsync they could have had (logged every 300 flips)
+static uint64_t g_pace_flips, g_pace_on_time, g_pace_game_late, g_pace_render_late, g_pace_gpu_late;
 static std::deque<PendingFlip> g_pending_flips;
 static uint64_t g_last_flip_vsync = 0;
 static uint64_t g_last_flip_time = 0;  // timebase
@@ -595,6 +630,9 @@ static int64_t g_count_offset = 0;     // guest-visible swap/flip counts minus o
 // The clock can run faster (fast forward, mods/turbo.cpp): the game then flips more often and plays
 // more frames per second, every one calculated and drawn as usual. vsync n is at
 // g_clock_base_time + (n - g_clock_base_index) * period / rate.
+// (merge fix: Modern used g_vsync_epoch as the clock's base but never defined it;
+// set_clock_rate re-bases on every rate change, so "now" at startup is the right base)
+static const std::chrono::steady_clock::time_point g_vsync_epoch = std::chrono::steady_clock::now();
 static std::mutex g_clock_mutex;
 static std::chrono::steady_clock::time_point g_clock_base_time = g_vsync_epoch;
 static uint64_t g_clock_base_index = 0;
@@ -624,8 +662,29 @@ void set_clock_rate(double rate) {
 static void update_flips() {  // g_flip_mutex held
     uint64_t now = vsync_index();
     while (!g_pending_flips.empty()) {
-        uint64_t at = std::max(g_pending_flips.front().vsync + 1, g_last_flip_vsync + interp::effective_swap_interval(g_swap_interval));
-        if (at > now || gfx::frames_completed() < g_pending_flips.front().swap) break;
+        PendingFlip& pf = g_pending_flips.front();
+        uint64_t ideal = g_last_flip_vsync + interp::effective_swap_interval(g_swap_interval);
+        uint64_t at = std::max(pf.vsync + 1, ideal);
+        if (at > now) break;
+        if (gfx::frames_completed() < pf.swap) {  // could flip now, but the frame isn't done
+            if (gfx::frames_submitted() < pf.swap) pf.waitedRender = 1;
+            else pf.waitedGpu = 1;
+            break;
+        }
+        g_pace_flips++;
+        if (pf.vsync + 1 > ideal) g_pace_game_late += pf.vsync + 1 - ideal;  // the swap came after its vsync
+        if (now > at) {
+            if (pf.waitedRender) g_pace_render_late += now - at;
+            else g_pace_gpu_late += now - at;
+        } else if (pf.vsync + 1 <= ideal) {
+            g_pace_on_time++;
+        }
+        if (g_pace_flips % 300 == 0) {
+            LOG("[pace] last 300 flips: %llu on time; vsyncs lost: game late %llu, render late %llu, GPU late %llu",
+                (unsigned long long)g_pace_on_time, (unsigned long long)g_pace_game_late, (unsigned long long)g_pace_render_late,
+                (unsigned long long)g_pace_gpu_late);
+            g_pace_on_time = g_pace_game_late = g_pace_render_late = g_pace_gpu_late = 0;
+        }
         at = now;
         g_pending_flips.pop_front();
         g_last_flip_vsync = at;
@@ -636,6 +695,9 @@ static void update_flips() {  // g_flip_mutex held
 
 HLE(gx2, GX2Init) {
     set_default_state();
+#ifdef __ANDROID__
+    display_vsync::start();
+#endif
     LOG("[gx2] initialized (native GX2 -> %s)", gfx::backend_name());
 }
 
@@ -853,6 +915,14 @@ HLE(gx2, GX2SwapScanBuffers) {
         g_swap_count++;
         g_pending_flips.push_back({vsync_index(), g_swap_count});
     }
+#ifdef __ANDROID__
+    fps60::on_swap();
+    {
+        static uint32_t swaps = 0;
+        if (swaps++ % 30 == 0) platform::apply_thread_cores(false);  // the game thread follows the core setting
+    }
+    perf_hint::on_swap(interp::effective_swap_interval(g_swap_interval));
+#endif
     if (g_swap_count % 300 == 1) {
         static auto last = std::chrono::steady_clock::now();
         auto now = std::chrono::steady_clock::now();

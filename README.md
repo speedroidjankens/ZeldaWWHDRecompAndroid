@@ -1,4 +1,4 @@
-# TLoZ:TWW HD Recompiled — Android
+# Wind Waker HD Recompiled — Android Enhanced
 
 An Android port of the [ZeldaWWHDRecomp](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp) project:
 The Legend of Zelda: The Wind Waker HD (Wii U, USA, European and Japanese versions) as a native app for 64-bit ARM Android
@@ -10,9 +10,8 @@ between.
 `.wux`) dumped from your own Wii U disc, with its keys, or a Cemu archive (`.wua`) made from it. On the first start the app extracts the game
 from it and builds the game code on your device.
 
-The original project (macOS, the 60 fps modes, decompilation tools) is described in
-[docs/original-readme.md](docs/original-readme.md); how the recompilation works in
-[docs/how-it-works.md](docs/how-it-works.md).
+**The app contains no game files**, no game code and no keys. You need your own Wii U disc image
+(`.wud`/`.wux`) with its keys.
 
 ## What this fork adds
 
@@ -180,7 +179,23 @@ The original project (macOS, the 60 fps modes, decompilation tools) is described
   (the game reads them back from the GPU to save them).
 - **No internet access**: the app doesn't request it, and its manifest explicitly excludes it.
 
-## Version history
+### Graphics
+- **Native widescreen**: the game renders at your screen's shape (21:9, 20:9...) instead of
+  stretching 16:9. The camera sees more to the sides with the same vertical view (Hor+), the
+  culling follows, and the HUD keeps its proportions with hearts, rupees and buttons at the new
+  screen edges (Options → *Widescreen*, switchable while playing). Ported from the official
+  project's aspect-ratio support.
+- **Shadows fixed**: no more flickering between the near (detailed) and far (basic) shading when
+  moving the camera, and no more grid / moire pattern on sand and other ground. The causes were
+  dynamic depth bias left over from the previous render pass and work submitted in chunks in the
+  middle of a frame.
+- Renderer fixes ported from the official Vulkan backend: invariant vertex positions for multipass
+  depth tests, depth-compare samplers bound to depth surfaces, `GX2CopySurface` of depth and array
+  slices, uniform blocks compared instead of trusted to write tracking.
+- From the original project's v0.5: **sun corona and lens flare** (the game's depth peeks read the GPU
+  depth buffer), **distance haze and bloom** with a proper mip chain (also removes black lines in
+  shadows), and the **Japanese version** (address map `tools/recomp/release_jpn.txt`).
+- Ambient occlusion modes, including **Off**.
 
 **0.9.9c**
 
@@ -573,33 +588,50 @@ The original project (macOS, the 60 fps modes, decompilation tools) is described
 
 **0.4**
 
-- Controller buttons can be assigned to other Wii U buttons (Controls › Controller buttons).
-- A new mod: faster running and swimming, each 1.25× up to 4×, always or with L3 (press to switch
-  on and off, or hold).
-- Updating from 0.3 keeps the prepared game code: no new compile.
+### Performance
+The renderer's CPU work per frame was cut to a fraction in busy scenes, measured with simpleperf on a
+Snapdragon 8 Gen 2:
+- a **fast path for repeated draws** (grass, trees, crowds: thousands per frame), which reuses
+  everything resolved while only uniforms or vertex data change;
+- **identical vertex and uniform copies reused** within a submission (often 20+ MB per frame);
+- redundant Vulkan state skipped, cheaper shader and texture lookups, context switches that copy
+  only the registers in use, descriptor sets reused between draws;
+- **ADPF performance hints** and a choice of **CPU cores** (automatic, performance cores, or the
+  prime core for the game or the renderer);
+- the guest vsync clock **locked to the display**, the screen asked for 60 Hz instead of 120, a
+  pre-rotated swapchain, and a scheduler tick that sleeps when idle;
+- from the original project: the Miiverse thread that spun a whole core is throttled, the pipeline
+  queue is checked in slices, and compile waits wake on completion;
+- the game code compiled at `-O3`.
 
-**0.3**
+### More
+- **60 fps** by frame interpolation (game logic stays at 30 steps a second, nothing speeds up),
+  holding full speed anywhere between 30 and 60 fps, **40 fps** on 120 Hz screens (a frame every 3
+  refreshes, evenly paced, for phones that can't hold 60), an **adaptive** mode that falls back to 30 where the device can't hold 60, and the original
+  project's redesigned **True 60** (experimental).
+- **Game language** selector: English, Spanish, French (the USA disc's languages).
+- **Cheats** from the original project: items, sword and shield, hearts, songs, Triforce, dungeon
+  items, infinite health / magic / ammo.
+- A **GameCube to HD save converter** (`tools/savegame/`, run on a PC).
+- Performance overlay with a **pacing diagnostic** in the log (which frames missed their vsync, and
+  whether the game, the renderer or the GPU was late).
 
-- The European version of the game is now supported. A Game tab to choose the game language was added in the overlay options menu.
-- Custom GPU drivers on Adreno GPUs (Turnip, newer Qualcomm drivers). Install them in the overlay options menu in the graphics settings.
-- Gyro aiming with the device or a controller motion sensors, also in Pro Controller mode which is useful for single screen devices.
-- Force feedback is working on the device in touchscreen mode or with a connected controller.
-- The WiiU GamePad picture on the second screen of dual-screen devices.
-- Save states keep the controller mode and switch back to it when loaded.
-- Performance overlay: average frame rate, the graphics settings in use, SoC, GPU and GPU driver,
-  with labelled values.
-- Faster on Mali and other GPUs without BC textures; less CPU time on the render thread; Android
-  performance hints, game modes and SVE.
-- Fixes:
-  - A crash at boot where the device's storage tells upper and lower case apart
-  - The Saves tab shows a new state as soon as it is written
-  - Removing a GPU driver removes its pipeline cache
+## Recommended settings
 
-**0.2**: the first release (USA version).
+On a recent phone: **Frame rate** 60 fps (or adaptive), **rendering resolution** 1×,
+**CPU cores** Automatic or *Prime core (game)*, **GX2DrawDone** *Wait*. The options marked
+*Experimental* are for testing.
+
+Most of the game holds 60 fps on a Snapdragon 8 Gen 2. Very busy views (the title screen flight
+over the island, big islands seen from afar) can still drop, and a hot phone lowers its clocks.
 
 ## Getting started
 
-You need:
+1. Put your disc image (`.wux` or `.wud`), its disc key (`.key`, same name as the image) and the
+   Wii U common key (`common.key`) in one folder on your device.
+2. Install the APK from the Releases page and start it. Choose **Extract from your disc image…**
+   and select that folder.
+3. The app extracts the game and compiles its code for your device (about 5 minutes, once).
 
 - an Android 11 (or newer) device with a 64-bit ARM processor and Vulkan 1.1, about 2 GB of free
   storage and, for the one-time compile, about 2 GB of free memory;
@@ -765,48 +797,27 @@ names the driver that hung and offers another one before the game starts.
 
 ## Building
 
-You need the Android SDK (platform 36), NDK 27.2.12479018, JDK 17, CMake 3.20+, Ninja, git and
-Python 3.
-
-**The APK without game code** builds LLVM for Android once (about 20
-minutes on a 12-core PC, 2 GB in `build/llvm`), then the app:
+As in the [Android port](docs/android-port-readme.md#building): Android SDK 36, NDK 27.2.12479018,
+JDK 17, CMake, Ninja, Python 3, and LLVM built once for Android (`tools/android/build-llvm.sh`), then
 
 ```sh
-tools/android/build-llvm.sh          # -> build/llvm/install (LLVM 20.1.8: AArch64 code generation, ORC JIT)
 cd android
-echo "sdk.dir=$HOME/Android/Sdk" > local.properties
-./gradlew assembleRelease -PwwhdDeviceRecomp -PwwhdVersionCode=3 -PwwhdVersionName=0.3
+./gradlew assembleRelease -PwwhdDeviceRecomp -PwwhdVersionCode=<n> -PwwhdVersionName=<name>
 ```
 
-Sign it with your own release key.  
-
-```sh
-keytool -genkeypair -keystore ~/.android/wwhd-release.jks -storetype PKCS12 -alias wwhd \
-        -keyalg RSA -keysize 4096 -validity 10000 -dname "CN=Your name"
-cat > android/keystore.properties <<EOF
-storeFile=/home/you/.android/wwhd-release.jks
-storePassword=...
-keyAlias=wwhd
-keyPassword=...
-EOF
-```
-
-`android/keystore.properties`, `*.jks` and `*.keystore` are in `.gitignore`; never commit them.
-Raise the version code with every APK you share. Release builds ignore the testing launch extras
-(`WWHD_*`, `gameDir`).
+Sign release APKs with your own key (`android/keystore.properties`, never committed).
 
 ## Legal notice
 
-This is an unofficial fan project. It is not affiliated with, endorsed or sponsored by Nintendo or
-by the developer of Lossless Scaling. "The Legend of Zelda", "The Wind Waker", "Wii U" and related
-names are trademarks of their respective owners and are used here only to describe what this
-software is compatible with.
+This is an unofficial fan project. It is not affiliated with, endorsed or sponsored by Nintendo.
+"The Legend of Zelda", "The Wind Waker", "Wii U" and related names are trademarks of their
+respective owners and are used here only to describe what this software is compatible with.
 
-This repository and the APK contain **no game code, no game assets, no keys and
-no part of Lossless Scaling**. To use the app you need your own, legally obtained copy of the game,
-dumped from your own Wii U disc and console, and for frame generation your own copy of Lossless
-Scaling. Everything game-specific (the extracted files, the compiled game code, shader caches) is
-created on your device from your own legal dump and must not be redistributed. 
+This repository and the APK contain **no game code, no game assets and no keys**. The icons in
+`android/app/src/main/res/drawable-nodpi` are original artwork in the style of the game; the game's
+own artwork is read from your copy on your device and never leaves it. You need your own, legally
+obtained copy of the game, dumped from your own Wii U disc and console. Everything game-specific
+created on your device must not be redistributed.
 
 ## License
 

@@ -485,6 +485,7 @@ struct Shader {
     uint64_t key = 0;
     bool vertex = false;
     LatteDecompilerShader* dec = nullptr;
+    uint32_t areaUnits = 0;                   // pixel shader units read area-sampled (area_sample.h)
     Module* mod = nullptr;                    // set when compiling is requested
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     std::vector<VkDescriptorSetLayoutBinding> bindings;
@@ -946,7 +947,6 @@ static void create_set_layout(Shader* sh) {
     cache[h] = sh->dsl;
 }
 
-// registers that influence how a shader stage is translated (gathered, then hashed in one pass)
 // The registers the shader key takes whole (stage_state_hash); shader_reg_relevant below derives
 // from this table and the masked ones in stage_state_hash, so keep both in step.
 static const struct { uint32_t first, count; } kKeyRegs[] = {
@@ -956,6 +956,7 @@ static const struct { uint32_t first, count; } kKeyRegs[] = {
     {REGADDR::PA_CL_VTE_CNTL, 1}, {REGADDR::PA_CL_CLIP_CNTL, 1}, {REGADDR::CB_COLOR_CONTROL, 1}, {REGADDR::CB_TARGET_MASK, 1},
     {mmCB_COLOR0_INFO, 8}};
 
+// the register state that shapes a stage's translation, as words (hashed into the shader key)
 static uint32_t stage_state_words(const uint32_t* regs, uint32_t texBase, uint32_t* buf) {
     uint32_t n = 0;
     for (auto& k : kKeyRegs) {
@@ -2017,17 +2018,29 @@ static VkPipelineLayout get_pipeline_layout(Shader* vs, Shader* ps) {
     return l;
 }
 
-// Ambient-occlusion quirks, switchable in game (settings menu; WWHD_AO_MODE=0..2 sets the start):
+// Ambient-occlusion quirks, switchable in game (settings menu; WWHD_AO_MODE=0..3 sets the start):
 //   0 = as the hardware renders it
 //   1 = centre depth sampled bilinear (removes the every-third-row lines)
 //   2 = 1 + noise tiled per 960x540 pixel instead of per 640x360 pixel (removes the remaining
 //       uneven noise bands the game's blur can't average out)
+//   3 = disabled (the AO pass writes neutral white)
 static std::atomic<int> g_ao_mode{[] {
-    if (const char* e = getenv("WWHD_AO_MODE")) return atoi(e) % 3;
+    if (const char* e = getenv("WWHD_AO_MODE")) return std::clamp(atoi(e), 0, 3);
     return getenv("WWHD_NO_AO_QUIRK") ? 0 : 2;
 }()};
 int ao_mode() { return g_ao_mode.load(std::memory_order_relaxed); }
-void set_ao_mode(int m) { g_ao_mode = m % 3; LOG("[gfx] ambient occlusion mode %d", m % 3); }
+// Bloom strength (graphics setting, percent; original project 8ebcc6f): the bloom extract shader
+// (PS 44F91200) reads its intensity from remapped[2].z (cThresholdParam.z); scaled once there,
+// before the blur and downsampling. 100 the original game, 0 off, up to 200.
+static std::atomic<int> g_bloom_pct{[] {
+    const char* e = getenv("WWHD_BLOOM_STRENGTH");
+    return e ? std::clamp((int)(atof(e) * 100.0f), 0, 200) : 100;
+}()};
+bool area_blur() { return g_area_blur.load(std::memory_order_relaxed); }
+void set_area_blur(bool on) { g_area_blur = on; LOG("[gfx] console-accurate blur %s", on ? "on" : "off"); }
+int bloom_strength() { return g_bloom_pct.load(std::memory_order_relaxed); }
+void set_bloom_strength(int pct) { g_bloom_pct = std::clamp(pct, 0, 200); LOG("[gfx] bloom strength %d%%", g_bloom_pct.load()); }
+void set_ao_mode(int m) { m = std::clamp(m, 0, 3); g_ao_mode = m; LOG("[gfx] ambient occlusion mode %d", m); }
 
 // Draws whose shaders or pipeline are still compiling wait for the compile, up to a per-frame budget
 // (WWHD_COMPILE_WAIT_MS, default 8; the game's frame is 33 ms), and are skipped after it: new things
@@ -5055,6 +5068,9 @@ static void record_draw(const uint32_t* regs, const Prepared& P, uint32_t prim, 
         draw(regs, prim, count, indexType, indexAddr, baseVertex, instances);
         g_hires_redraw = false;
     }
+    // a new command buffer since the indices were uploaded (render pass changes): upload them again
+    if (indices.n && R.cmdSerial != indicesSerial) draw_indices(prim, count, indexType, indexAddr, indices);
+    record_draw(regs, P, prim, count, indexType, indexAddr, baseVertex, instances, indices);
 }
 
 void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr, uint32_t baseVertex,

@@ -516,7 +516,8 @@ struct KankyoTrace { int moving = 0, words = 0; double frac = 0; };
 void kankyo_move(Cpu* c, int k, void (*orig)(Cpu*)) {
     const KankyoKind& kk = kKankyo[k];
     uint32_t pk = ld32(kEnvLight + kk.env_off);
-    if (!on(32) || !interp::logic_pass() || pk < 0x10000000 || pk >= 0x50000000) {
+    // (was blend_pass() in Enhanced's version; Modern renamed it halfway())
+    if (!on(32) || !halfway() || pk < 0x10000000 || pk >= 0x50000000) {
         orig(c);
         return;
     }
@@ -642,7 +643,8 @@ extern "C" void hook_0256A448(Cpu* c) {
             LOG("%s", b);
         }
     }
-    if (!on(2) || !interp::logic_pass() || !pk) {
+    // (was blend_pass() in Enhanced's version; Modern renamed it halfway())
+    if (!on(2) || !halfway() || !pk) {
         f_0256A448_orig(c);
         return;
     }

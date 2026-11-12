@@ -11,6 +11,8 @@ struct GX2DepthBuffer;
 namespace gx2 {
 uint32_t color_buffer_address(const GX2::GX2ColorBuffer* cb);
 LatteFetchShader* build_fetch_shader(uint32_t program);  // from our encoded fetch "program"
+void set_drawdone_mode(int m);  // experiment: 0 GX2DrawDone waits for the render thread, 1 one behind, 2 never
+int drawdone_mode();
 }  // namespace gx2
 
 // The renderer backend (Metal on macOS, Vulkan on Android). All calls come from the thread executing GX2
@@ -43,6 +45,7 @@ bool target_is_drc(uint32_t w, uint32_t h);  // ... of the GamePad picture's (85
 // depth peeks (peekz.cpp): x, y (640x480 screen space) and the guest address of the answer, per point
 void peek_z(const uint32_t* cells, uint32_t n);
 uint64_t frames_completed();     // swaps whose GPU work has finished
+uint64_t frames_submitted();     // swaps the render thread has submitted
 void with_autorelease_pool(void (*fn)());  // render thread: drain Objective-C temporaries per batch
 void set_tv_format(uint32_t gx2Format, bool tv);  // GX2SetTVBuffer / GX2SetDRCBuffer
 void invalidate(uint32_t flags, uint32_t addr, uint32_t size);

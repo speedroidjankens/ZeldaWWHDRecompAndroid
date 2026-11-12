@@ -38,12 +38,20 @@
 #include "../savestate.h"
 #include "../vk/lsfg.h"
 #include "../vk/vk_window.h"
+#include "fps60.h"
 #include "jni_bridge.h"
+#include "touch_hud.h"
+#include "ui_icons.h"
+#include "../motion.h"
 #include "recomp_table.h"
 
 namespace gfx {
 int ao_mode();
 void set_ao_mode(int m);
+int bloom_strength();
+bool area_blur();
+void set_area_blur(bool on);
+void set_bloom_strength(int pct);
 bool aniso_enabled();
 void set_aniso(bool v);
 bool vsync();
@@ -852,11 +860,35 @@ JNI_FN(void, setPaused)(JNIEnv*, jclass, jboolean paused) {
     if (paused && g_started) gfx::save_caches();
 }
 
+// official artwork for the touch controls from the game files (IconForge)
+JNI_FN(jint, extractUiTextures)(JNIEnv* env, jclass, jstring gameDir, jstring outDir, jobjectArray layouts, jobjectArray textures) {
+    std::vector<ui_icons::Request> req;
+    jsize n = env->GetArrayLength(textures);
+    for (jsize i = 0; i < n; i++) {
+        auto l = (jstring)env->GetObjectArrayElement(layouts, i), t = (jstring)env->GetObjectArrayElement(textures, i);
+        req.push_back({jstr(env, l), jstr(env, t)});
+        env->DeleteLocalRef(l);
+        env->DeleteLocalRef(t);
+    }
+    return ui_icons::extract(jstr(env, gameDir), jstr(env, outDir), req);
+}
+
+// game state for the touch controls' icons (ControlsView)
+JNI_FN(jintArray, hudState)(JNIEnv* env, jclass) {
+    int32_t s[touch_hud::kSize];
+    touch_hud::state(s);
+    jintArray a = env->NewIntArray(touch_hud::kSize);
+    env->SetIntArrayRegion(a, 0, touch_hud::kSize, s);
+    return a;
+}
+
 // settings shown in the app's menu
 JNI_FN(void, setOption)(JNIEnv* env, jclass, jstring name, jint value) {
     std::string n = jstr(env, name);
     if (n != "capture" && n != "area_flush" && n != "fly" && n != "memory_headroom" && n != "memory_threshold") crash_info::option(n, value);
     if (n == "ao_mode") gfx::set_ao_mode(value);
+    else if (n == "bloom_strength") gfx::set_bloom_strength(value);
+    else if (n == "area_blur") gfx::set_area_blur(value != 0);
     else if (n == "ao_hires") gfx::set_ao_hires(value != 0);
     else if (n == "area_blur") gfx::set_area_blur(value != 0);
     else if (n == "aniso") gfx::set_aniso(value != 0);
@@ -904,6 +936,11 @@ JNI_FN(void, setOption)(JNIEnv* env, jclass, jstring name, jint value) {
         if (value) interp::set_fps(value);
         interp::set_mode(value ? 1 : 0);
     }
+    // frame rate modes (fps60.cpp, Enhanced's setting): 0 30 fps, 1 60 fps, 3 true 60,
+    // 4 40 fps (core port pending, runs as 60 fps interpolation for now), 5 120 fps
+    else if (n == "fps_mode") fps60::set_mode(value);
+    // tick speed (turbo.cpp): whole-game fast forward, 1-9x (1 = normal speed)
+    else if (n == "tick_speed") mods::set_tick_speed(value);
     // 60 fps (generated, vk/reproj.cpp): the game at its own 30, every other frame made on the GPU
     else if (n == "fps_generated") {
         if (value) interp::set_mode(0);
@@ -1011,6 +1048,8 @@ JNI_FN(jint, getOption)(JNIEnv* env, jclass, jstring name) {
     if (n == "render_aspect") return aspect::mode() == aspect::kWindow ? 1 : 0;
     if (n == "interp_fps") return interp::mode() == 1 ? interp::fps() : 0;
     if (n == "fps_generated") return gfx::builtin_frame_generation() ? 1 : 0;
+    if (n == "fps_mode") return fps60::mode();
+    if (n == "tick_speed") return mods::tick_speed();
     if (n == "mod_direct_camera") return mods::direct_camera();
     if (n == "mod_camera_speed") return (int)lroundf(mods::camera_speed() * 100);
     if (n == "swipe_boat") return (int)lroundf(mods::swipe_boat() * 100);

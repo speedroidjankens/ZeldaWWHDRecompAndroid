@@ -180,6 +180,17 @@ void set_fps(int f) {
 }
 // the 60 fps mode: 0 off, 1 frame interpolation (at fps()), 2 true 60 (game logic at 60 steps per second)
 int mode() { return true60::enabled() ? 2 : interp_on() ? 1 : 0; }
+// 40 fps mode (Enhanced's fps60.cpp mode 4, 120 Hz displays: 4 frames per 3 logic steps).
+// MERGE NOTE: this is a flag only. Modern's interpolation core has no 4-frames-per-3-steps
+// path, so while the flag is on, fps60 mode 4 runs as 60 fps interpolation (see fps60.cpp).
+// Making it a real 40 fps means porting Enhanced's interp.cpp phase40 cycle
+// (g_phase40, pass_t() kW40 weights, the hold-pass rules) into this file's pass structure.
+static std::atomic<bool> g_mode40{false};
+bool mode40() { return g_mode40.load(std::memory_order_relaxed) && interp_on(); }
+void set_mode40(bool v) {
+    if (g_mode40.exchange(v) != v && v)
+        LOG("[interp] 40 fps mode: core port pending (see MERGE-NOTES.md), running 60 fps interpolation");
+}
 void set_mode(int m) {
     g_on = false;
     true60::set_enabled(false);

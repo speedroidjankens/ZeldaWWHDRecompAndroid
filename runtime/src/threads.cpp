@@ -614,7 +614,7 @@ __attribute__((noinline)) static void try_entry_park(HostThread* t, Cpu* c) {
 }
 
 namespace threads {
-void park_sleep_until(std::chrono::steady_clock::time_point tp) {
+void park_sleep_until(std::chrono::steady_clock::time_point tp, bool precise) {
     HostThread* t = t_self;
     if (!t) {
         block_begin();

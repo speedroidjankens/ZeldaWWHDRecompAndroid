@@ -22,6 +22,8 @@ bool direct_camera();
 void set_direct_camera(bool on);
 float camera_speed();  // direct camera: multiplier of the game's own top turning speed
 void set_camera_speed(float s);
+float camera_zoom();   // pinch zoom (touch): the drawn camera's distance to its target x this (1 = the game's)
+void set_camera_zoom(float z);
 bool mouse_camera();
 void set_mouse_camera(bool on);
 float mouse_sensitivity();  // degrees per mouse point
@@ -66,6 +68,9 @@ void stick_input(float x, float y);  // filter_pad: the left stick of this read
 // frame
 bool ff_cutscenes();
 void set_ff_cutscenes(bool on);
+// tick speed (turbo.cpp): whole-game fast forward, 1-9x (1 = normal speed)
+int tick_speed();
+void set_tick_speed(int v);
 // songs conducted: Link plays the tune once more before its effect, as on the GameCube (songs.cpp)
 void set_song_replay(bool on);
 // pictos mailed to Carlov at postboxes (postbox.cpp): the figurine the next day, or at once (same day delivery)

@@ -78,6 +78,10 @@ struct Voice {
 
 std::mutex g_ax_mutex;
 Voice g_voices[kMaxVoices];
+// GamePad mix per voice (device 1, index 0), left and right: played instead of the TV mix when that
+// is silent, as when the game moves to the GamePad (off-TV play), which has no output of its own
+// here. Kept outside Voice, which save states store as is.
+ChMix g_drc_mix[kMaxVoices][2][kBuses];
 uint32_t g_vpb_base = 0;
 uint32_t g_app_frame_cb[64] = {};
 uint32_t g_final_mix_cb[3] = {};

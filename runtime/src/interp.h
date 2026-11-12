@@ -11,6 +11,10 @@ void record_executed_step(); // game thread; includes built-in turbo passes
 uint64_t executed_steps();    // actual actor logic passes, including true60 half steps
 int mode();                 // 0 off (30 fps), 1 frame interpolation (at fps()), 2 true 60
 void set_mode(int m);
+// 40 fps (Enhanced's fps60 mode 4, 120 Hz displays): a flag only, for now —
+// Modern's interpolation core has no 4-frames-per-3-steps path yet (see interp.cpp).
+bool mode40();
+void set_mode40(bool v);
 int fps();                  // frame interpolation's chosen frame rate: 60, 120 or 240
 void set_fps(int f);
 void toggle_fps(int f);     // frame interpolation at f on, or off if it is on at f (menus, the 6 key)

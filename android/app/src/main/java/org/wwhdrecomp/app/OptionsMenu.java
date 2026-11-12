@@ -1218,6 +1218,25 @@ final class OptionsMenu extends Dialog {
         });
         String[] res = new String[MainActivity.RES_SCALES.length];
         for (int i = 0; i < res.length; i++) res[i] = a.resolutionLabel(MainActivity.RES_SCALES[i]);
+        // 30, 60 and true 60 everywhere; 120 and 40 fps only on 120 Hz panels (fps60.cpp's modes)
+        int[] fpsModes = a.has120Hz() ? new int[] {0, 1, 5, 4, 3} : new int[] {0, 1, 3};
+        String[] fpsNames = new String[fpsModes.length];
+        int fpsMode = a.prefs.getBoolean("fg_enabled", false) ? 0 : a.savedFpsMode(), fpsIndex = 0;
+        for (int i = 0; i < fpsModes.length; i++) {
+            fpsNames[i] = a.fpsModeName(fpsModes[i]);
+            if (fpsModes[i] == fpsMode) fpsIndex = i;
+        }
+        choice(R.string.opt_fps, R.string.opt_fps_hint, fpsNames, fpsIndex, i -> a.setFpsMode(fpsModes[i]));
+        choice(R.string.opt_drawdone, R.string.opt_drawdone_hint, a.getResources().getStringArray(R.array.drawdone_modes),
+               a.prefs.getInt("drawdone_mode", 0), i -> {
+                   a.prefs.edit().putInt("drawdone_mode", i).apply();
+                   Native.setOption("drawdone_mode", i);
+               });
+        choice(R.string.opt_core_mode, R.string.opt_core_mode_hint, a.getResources().getStringArray(R.array.core_modes),
+               a.prefs.getInt("core_mode", 0), i -> {
+                   a.prefs.edit().putInt("core_mode", i).apply();
+                   Native.setOption("core_mode", i);
+               });
         choice(R.string.opt_resolution, 0, res, indexOf(MainActivity.RES_SCALES, a.prefs.getString("res_scale", "1"), 2), a::setResolution);
         int[] rates = a.interpRates();
         String[] rateNames = new String[rates.length + 1];  // the last one: 60 fps (generated)
@@ -1231,6 +1250,14 @@ final class OptionsMenu extends Dialog {
         choice(R.string.opt_interp, R.string.opt_interp_hint, rateNames, rate, i -> {
             if (i == rates.length) a.setFpsGenerated();
             else a.setInterpFps(rates[i]);
+        });
+        // tick speed (this fork): whole-game fast forward, 1x-9x, single digit only
+        String[] tickNames = new String[9];
+        for (int i = 0; i < 9; i++) tickNames[i] = (i + 1) + "x";
+        int tick = Native.getOption("tick_speed");
+        choice(R.string.opt_tick_speed, R.string.opt_tick_speed_hint, tickNames, Math.max(0, Math.min(8, tick - 1)), i -> {
+            a.prefs.edit().putInt("tick_speed", i + 1).apply();
+            Native.setOption("tick_speed", i + 1);
         });
         submenu(R.string.opt_framegen, 0, a.frameGenLabel(), () -> openPage(this::frameGenPage));
         submenu(R.string.opt_page_res, R.string.opt_page_res_hint, "", () -> openPage(this::resolutionPage));

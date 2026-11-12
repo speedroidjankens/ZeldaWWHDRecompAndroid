@@ -14,6 +14,14 @@ void set_thread_name(const char* name);
 // (macOS QoS user-interactive; Android: a raised nice value and the performance hint session).
 // WWHD_NO_QOS=1 skips the priority.
 void set_thread_high_priority();
+// Android: where the render and game threads run (0 automatic, 1 performance cores, 2 prime core
+// for the render thread); the threads call apply_thread_cores from time to time, which also restores
+// an affinity the system changed. WWHD_CORE_MODE sets the initial mode.
+// (merge fix: declared in Enhanced's platform.h and implemented in platform.cpp;
+// Modern's platform.h lacked the declarations, so gx2_core.cpp could not call it)
+void set_core_mode(int m);
+int core_mode();
+void apply_thread_cores(bool render);
 // game and render thread: kept on the big cores where the scheduler places threads by load alone
 // (no performance hint session: Android 12 and older, or the device refuses one). Without the
 // session's guidance, a lighter render thread or the game thread drifts to the little cores (Snapdragon 855:
