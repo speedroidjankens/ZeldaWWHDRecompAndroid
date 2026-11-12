@@ -1714,7 +1714,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         if (prefs.getBoolean("defaults_set", false)) return;
         SharedPreferences.Editor e = prefs.edit().putBoolean("defaults_set", true);
         if (!prefs.contains("layout") && !controllerAttached()) {
-            e.putInt("layout", LAYOUT_HYBRID);
+            e.putInt("layout", LAYOUT_INSET);
             if (!prefs.contains("pro_controller")) e.putBoolean("pro_controller", false);
         }
         e.apply();
@@ -2140,10 +2140,6 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             case LAYOUT_DRC_LARGE:
                 drc = full;
                 tv = inset;
-                break;
-            case LAYOUT_HYBRID:  // the GamePad is drawn over the TV
-                tv = full;
-                drc = hybridMenu ? full : null;
                 break;
             default:
                 tv = full;
@@ -3114,7 +3110,6 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         applyControlsAppearance();
     }
 
-    @Override
     public void onLayoutSaved(String layout) {
         prefs.edit().putString("touch_layout", layout).apply();
     }
@@ -3124,11 +3119,17 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         info(getString(R.string.gyro_recalibrated));
     }
 
+    void setControlsVisible(boolean on) {
+        prefs.edit().putBoolean("controls_visible", on).apply();
+        autoHidden = false;
+        applyControlsAppearance();
+    }
+
     /** the layout editor over the game (from the options menu) */
     void editTouchLayout() {
         if (controls == null) return;
         if (!prefs.getBoolean("controls_visible", true)) setControlsVisible(true);
-        controls.setEditMode(true);
+        controls.setEditing(true);
     }
 
     @Override
@@ -4431,12 +4432,6 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         return Math.round(hz);
     }
 
-    // frames shown per second without frame generation: 30, or the interpolated rate
-    int shownFps() {
-        int f = Native.getOption("interp_fps");
-        return f > 0 ? f : 30;
-    }
-
     void setInterpFps(int fps) {
         boolean generated = prefs.getBoolean("fps_generated", false);
         prefs.edit().putInt("interp_fps", fps).putBoolean("fps_generated", false).apply();
@@ -4449,14 +4444,6 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         prefs.edit().putInt("interp_fps", 0).putBoolean("fps_generated", true).apply();
         Native.setOption("interp_fps", 0);
         Native.setOption("fps_generated", 1);
-    }
-
-    // the display's highest refresh rate (at least 60)
-    int maxRefreshHz() {
-        float hz = 60;
-        for (android.view.Display.Mode m : getWindowManager().getDefaultDisplay().getSupportedModes())
-            hz = Math.max(hz, m.getRefreshRate());
-        return Math.round(hz);
     }
 
     // frames shown per second without frame generation (the Frame rate setting)

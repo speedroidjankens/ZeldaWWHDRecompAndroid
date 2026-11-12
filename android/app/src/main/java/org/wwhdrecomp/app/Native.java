@@ -239,8 +239,6 @@ final class Native {
     /** game state for the touch controls: {flags, A action, B action, ZR action, X, Y, R item} */
     static native int[] hudState();
     /** gyro aiming: a sensor sample in GamePad axes (rad/s, m/s^2, ns), on/off, recentre */
-    /** decodes game textures to outDir/<texture>.rgba (IconForge); returns how many */
-    static native int extractUiTextures(String gameDir, String outDir, String[] layouts, String[] textures);
 
     /** Warp (developer menu): to a stage's room and spawn at the next frame; layer -1 = the story's. False without a loaded save file. */
     static native boolean warp(String stage, int room, int spawn, int layer);

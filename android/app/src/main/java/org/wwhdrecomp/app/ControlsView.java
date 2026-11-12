@@ -98,7 +98,6 @@ final class ControlsView extends View {
         Control(int kind, int bit, String label, boolean round) {
             this.kind = kind;
             this.bit = bit;
-            this.color = color;
             this.label = label;
             this.round = round0 = round;
             key = "BSDMT".charAt(kind) + label;
@@ -113,16 +112,11 @@ final class ControlsView extends View {
             if (drawShape == SHAPE_HEX) return ey <= 1 && ex + ey / 2 <= 1;
             return ex <= 1 && ey <= 1;
         }
-        boolean custom() { return !Float.isNaN(fx); }
-        boolean removed;  // taken off the screen in the layout editor
-        boolean removable() { return kind != K_MENU && kind != K_EDIT; }  // the way back to the menus stays
     }
 
     private final Listener listener;
-    private final TouchIcons icons;
-    private final List<Ctl> controls = new ArrayList<>();
-    private final HashMap<String, Ctl> byId = new HashMap<>();
-    private final SparseArray<Ctl> pointers = new SparseArray<>();
+    private final List<Control> controls = new ArrayList<>();
+    private final SparseArray<Control> pointers = new SparseArray<>();
     private int drcPointer = -1;
     // a touch on the items page off the game's buttons, held back from the game until it shows its way: to the
     // right it pulls in the options page (MainActivity.onPageDrag), otherwise it goes to the game as it began
@@ -143,6 +137,28 @@ final class ControlsView extends View {
     private boolean flexible, showSticks = true, swipeCamera;
     private int swipePointer = -1;
     private float swipeX, swipeY, swipeSpeed = 2f;
+
+    // Enhanced's swipe-camera / combat-macro state (merged in): the camera on swipes over the
+    // right side, pinch zoom, and one-touch combat moves; the fields their code needs
+    private float baseUnit = 1;  // u without the size setting (layoutControls sets it)
+    private float cameraSensitivity = 1f;
+    private boolean haptics = true;
+    private int combatMode;  // 0 auto, 1 always, 2 never (setTouchOptions)
+    private float stickX, stickY;  // the left stick's deflection while a combat move holds it
+    private int camPointer = -1;
+    private float camLastX, camLastY, camAccX, camAccY, camX, camY;
+    private long lastCamTap;
+    private float camDownX, camDownY;
+    private int pinchPointer = -1;
+    private float pinchX, pinchY, pinchStartDist, pinchStartZoom, cameraZoom = 1f;
+    private int pulseBits;
+    private int[][] macro;  // steps: {ms, buttons, stick? 1:0, sx*1000, sy*1000}
+    private int macroStep = -1;
+    private int macroBits;
+    private boolean macroStick;
+    private float macroSx, macroSy;
+    private boolean hudPolling;
+    private static final int M_JUMP = 1, M_VERTICAL = 2, M_SPIN = 3, M_DODGE = 4;
 
     ControlsView(Context c, Listener l) {
         super(c);
@@ -1413,6 +1429,12 @@ final class ControlsView extends View {
         this.haptics = haptics;
         this.combatMode = combatMode;
         invalidate();
+    }
+
+    private void startHudPoll() {
+        if (hudPolling) return;
+        hudPolling = true;
+        post(pollState);
     }
 
     boolean controlsVisible() { return controlsVisible; }
@@ -2842,8 +2864,6 @@ final class ControlsView extends View {
     float stickX(int i) { return i == 0 && putAwaySince >= 0 ? 0 : controls.get(5 + i).sx; }
     float stickY(int i) { return i == 0 && putAwaySince >= 0 ? 0 : i == 0 && zooming() ? zoomLy : controls.get(5 + i).sy; }
 
-    float stickX(int i) { return i == 0 ? (macroStick ? macroSx : stickX) : camX; }
-    float stickY(int i) { return i == 0 ? (macroStick ? macroSy : stickY) : camY; }
 
     private void changed() {
         listener.onControlsChanged();
@@ -2981,6 +3001,7 @@ final class ControlsView extends View {
     // u = shorter side / 7 (landscape), times the size setting
     private void layoutControls(int W, int H) {
         if (W == 0 || H == 0) return;
+        baseUnit = Math.min(W, H) / 7f;
         float u = Math.min(W, H) / 7f * scale;
         float m = u * 0.25f;  // edge margin
         for (Control c : controls) {
@@ -3699,14 +3720,10 @@ final class ControlsView extends View {
                 float x = e.getX(idx), y = e.getY(idx);
                 fingerAt.put(id, new float[] {x, y});
                 if (perfTouchDown(id, x, y)) break;
-                Ctl c = controlAt(x, y);
+                Control c = controlAt(x, y);
                 if (c != null) {
-                    if (c.kind == K_MENU || c.kind == K_EDIT) {
-                        // a touch on a hidden button only shows it
-                        if (!menuWasHidden) {
-                            if (c.kind == K_MENU) listener.onMenu();
-                            else setEditMode(true);
-                        }
+                    if (c.kind == KIND_MENU) {
+                        if (!menuWasHidden) listener.onMenu();  // a touch on the hidden button only shows it
                         return true;
                     }
                     if (c.kind == KIND_SCREEN) {
@@ -4141,166 +4158,6 @@ final class ControlsView extends View {
                 break;
         }
         if (changed) changed();
-        return true;
-    }
-
-    // ---- layout editor: drag to move (snaps to the grid), drag the handle or pinch to resize
-    private boolean editMode;
-    private Ctl editSel;
-    private int editPointer = -1, editPointer2 = -1;
-    private boolean editResizing;
-    private float editDx, editDy, editPinchStart, editSizeStart;
-    private final RectF editReset = new RectF(), editDone = new RectF(), editRemove = new RectF(), editAdd = new RectF(),
-            editPanel = new RectF();
-    private boolean editAddOpen;  // the panel with the removed controls, to put them back
-    private final List<RectF> editPanelSlots = new ArrayList<>();
-    private final List<Ctl> editPanelCtls = new ArrayList<>();
-
-    private boolean anyRemoved() {
-        for (Ctl c : controls) if (c.removed) return true;
-        return false;
-    }
-
-    boolean editMode() { return editMode; }
-
-    void setEditMode(boolean on) {
-        if (on == editMode) return;
-        releaseAll();
-        changed();
-        editMode = on;
-        editSel = null;
-        editPointer = editPointer2 = -1;
-        invalidate();
-    }
-
-    private float grid() { return baseUnit * 0.25f; }
-
-    private float snap(float v) {
-        float g = grid();
-        return Math.round(v / g) * g;
-    }
-
-    /** makes the control's current place its saved place */
-    private void pin(Ctl c) {
-        int W = Math.max(1, getWidth()), H = Math.max(1, getHeight());
-        c.fx = c.cx / W;
-        c.fy = c.cy / H;
-        c.fd = c.r * 2 / baseUnit;
-    }
-
-    private float handleX(Ctl c) { return c.cx + c.r * 0.75f; }
-    private float handleY(Ctl c) { return c.cy + c.r * 0.75f; }
-
-    private boolean editTouch(MotionEvent e) {
-        int action = e.getActionMasked(), idx = e.getActionIndex();
-        int id = e.getPointerId(idx);
-        float x = e.getX(idx), y = e.getY(idx);
-        switch (action) {
-            case MotionEvent.ACTION_DOWN:
-            case MotionEvent.ACTION_POINTER_DOWN:
-                if (editPointer >= 0) {  // second finger: pinch the selected control
-                    if (editSel != null && editPointer2 < 0) {
-                        editPointer2 = id;
-                        int p = e.findPointerIndex(editPointer);
-                        editPinchStart = (float) Math.hypot(x - e.getX(p), y - e.getY(p));
-                        editSizeStart = editSel.r;
-                    }
-                    break;
-                }
-                if (editAddOpen) {  // the panel takes the touch: a control to put back, or outside to close
-                    for (int i = 0; i < editPanelSlots.size(); i++)
-                        if (editPanelSlots.get(i).contains(x, y)) {
-                            Ctl c = editPanelCtls.get(i);
-                            c.removed = false;
-                            editSel = c;
-                            buzz();
-                            break;
-                        }
-                    if (!editPanel.contains(x, y) || !anyRemoved()) editAddOpen = false;
-                    invalidate();
-                    return true;
-                }
-                if (editDone.contains(x, y)) {
-                    listener.onLayoutSaved(layoutString());
-                    setEditMode(false);
-                    return true;
-                }
-                if (editReset.contains(x, y)) {
-                    for (Ctl c : controls) {
-                        c.fx = c.fy = c.fd = Float.NaN;
-                        c.removed = false;
-                    }
-                    editSel = null;
-                    layoutControls(getWidth(), getHeight());
-                    invalidate();
-                    return true;
-                }
-                if (editRemove.contains(x, y)) {
-                    if (editSel != null && editSel.removable()) {
-                        editSel.removed = true;
-                        editSel = null;
-                        buzz();
-                    }
-                    invalidate();
-                    return true;
-                }
-                if (editAdd.contains(x, y)) {
-                    editAddOpen = anyRemoved();
-                    invalidate();
-                    return true;
-                }
-                editResizing = editSel != null && Math.hypot(x - handleX(editSel), y - handleY(editSel)) < baseUnit * 0.35f;
-                if (!editResizing) {
-                    Ctl c = controlAt(x, y);
-                    editSel = c;
-                    if (c != null) {
-                        editDx = x - c.cx;
-                        editDy = y - c.cy;
-                    }
-                }
-                if (editSel != null) editPointer = id;
-                invalidate();
-                break;
-            case MotionEvent.ACTION_MOVE: {
-                if (editSel == null || editPointer < 0) break;
-                int p = e.findPointerIndex(editPointer);
-                if (p < 0) break;
-                float px = e.getX(p), py = e.getY(p);
-                if (editPointer2 >= 0) {
-                    int q = e.findPointerIndex(editPointer2);
-                    if (q >= 0 && editPinchStart > 0) {
-                        float dist = (float) Math.hypot(px - e.getX(q), py - e.getY(q));
-                        setRadius(editSel, editSizeStart * dist / editPinchStart);
-                    }
-                } else if (editResizing) {
-                    setRadius(editSel, (float) Math.hypot(px - editSel.cx, py - editSel.cy) / 0.75f / (float) Math.sqrt(2));
-                } else {
-                    editSel.cx = Math.max(0, Math.min(getWidth(), px - editDx));
-                    editSel.cy = Math.max(0, Math.min(getHeight(), py - editDy));
-                }
-                pin(editSel);
-                invalidate();
-                break;
-            }
-            case MotionEvent.ACTION_UP:
-            case MotionEvent.ACTION_POINTER_UP:
-            case MotionEvent.ACTION_CANCEL:
-                if (id == editPointer2) {
-                    editPointer2 = -1;
-                } else if (id == editPointer || action == MotionEvent.ACTION_CANCEL) {
-                    if (editSel != null && !editResizing && editPointer2 < 0) {
-                        editSel.cx = snap(editSel.cx);
-                        editSel.cy = snap(editSel.cy);
-                        pin(editSel);
-                    }
-                    editPointer = editPointer2 = -1;
-                    editResizing = false;
-                }
-                invalidate();
-                break;
-            default:
-                break;
-        }
         return true;
     }
 
@@ -4942,85 +4799,6 @@ final class ControlsView extends View {
                 songPaint.setTextAlign(Paint.Align.CENTER);
                 canvas.drawText(t, cx, cy - (songPaint.descent() + songPaint.ascent()) / 2, songPaint);
             }
-            if (editMode && c == editSel) {
-                stroke.setColor(0xFFFFCC26);
-                stroke.setAlpha(255);
-                canvas.drawCircle(c.cx, c.cy, c.r * 1.05f, stroke);
-                icons.draw(canvas, "editor_resize_handle", 0xFFFFFFFF, "↘", handleX(c), handleY(c), baseUnit * 0.22f, 255, false);
-            }
-        }
-        if (editMode) drawEditBar(canvas);
-    }
-
-    private void drawButton(Canvas canvas, Ctl c, int a) {
-        String name = c.icon;
-        String overlay = null;
-        switch (c.id) {
-            case "a": {
-                String n = TouchIcons.at(TouchIcons.A_ACTIONS, state[HUD_A]);
-                if (n != null) name = n;
-                else overlay = "A";
-                break;
-            }
-            case "b": {
-                String n = TouchIcons.at(TouchIcons.B_ACTIONS, state[HUD_B]);
-                if (n != null) name = n;
-                break;
-            }
-            case "zr": {
-                String n = TouchIcons.at(TouchIcons.ZR_ACTIONS, state[HUD_ZR]);
-                if (n != null) name = n;
-                break;
-            }
-            case "x": case "y": case "r": {
-                int slot = c.id.equals("x") ? HUD_X : c.id.equals("y") ? HUD_Y : HUD_R;
-                String n = TouchIcons.at(TouchIcons.ITEMS, state[slot]);
-                if (n != null) name = n;
-                else overlay = c.label;
-                break;
-            }
-            case "zl":
-                if (hudFlag(HUD_TARGETING)) name = "zl_target_active";
-                break;
-            default:
-                break;
-        }
-        boolean pressed = c.pressed;
-        boolean hasIcon = icons.get(name) != null;
-        icons.draw(canvas, name, c.color, overlay != null ? overlay : c.label, c.cx, c.cy, c.r, a, pressed);
-        if (hasIcon && overlay != null) icons.label(canvas, overlay, c.cx, c.cy, c.r, a);
-    }
-
-    private void drawStick(Canvas canvas, Ctl c, int a) {
-        boolean active = stickPointer >= 0;
-        float bx = active ? stickOx : c.cx, by = active ? stickOy : c.cy;
-        int alpha = active ? a : a * 2 / 3;
-        if (icons.get("stick_base") != null) icons.draw(canvas, "stick_base", 0, null, bx, by, c.r, alpha, false);
-        else {
-            fill.setColor(TouchIcons.SKY);
-            fill.setAlpha(alpha / 3);
-            canvas.drawCircle(bx, by, c.r, fill);
-            stroke.setColor(TouchIcons.NAVY);
-            stroke.setAlpha(alpha);
-            canvas.drawCircle(bx, by, c.r, stroke);
-        }
-        float kx = bx + stickX * c.r * 0.8f, ky = by - stickY * c.r * 0.8f;
-        icons.draw(canvas, "stick_knob", TouchIcons.BONE, "", kx, ky, c.r * 0.42f, alpha, false);
-    }
-
-    private void drawGrid(Canvas canvas) {
-        fill.setColor(0xFF000000);
-        fill.setAlpha(90);
-        canvas.drawRect(0, 0, getWidth(), getHeight(), fill);
-        float g = grid();
-        stroke.setColor(0xFF9FD8FF);
-        for (int i = 0; i * g <= getWidth(); i++) {
-            stroke.setAlpha(i % 4 == 0 ? 90 : 35);
-            canvas.drawLine(i * g, 0, i * g, getHeight(), stroke);
-        }
-        for (int i = 0; i * g <= getHeight(); i++) {
-            stroke.setAlpha(i % 4 == 0 ? 90 : 35);
-            canvas.drawLine(0, i * g, getWidth(), i * g, stroke);
         }
     }
 

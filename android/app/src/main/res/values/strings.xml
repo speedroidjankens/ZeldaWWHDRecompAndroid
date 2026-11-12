@@ -1808,4 +1808,30 @@ If the picker doesn\'t show your files, put them directly into Download and open
     <string name="pad_cast_pick">These are waiting to be the screen. Pick one: it joins this device.</string>
     <string name="pad_cast_sent">Asking %1$s to be the screen…</string>
     <string name="pad_cast_failed">%1$s didn\'t answer. Is its search page still open?</string>
+    <string name="opt_fps">Frame rate</string>
+    <string name="opt_fps_hint">Frame interpolation: in-between frames from the game\'s 30 fps. Needs a fast CPU; where a frame doesn\'t fit in time it is left out and the game keeps its speed</string>
+    <string-array name="fps_modes">
+        <item>30 fps</item>
+        <item>60 fps</item>
+        <item>60 fps</item>
+        <item>True 60 (experimental)</item>
+    </string-array>
+    <string name="fps_40">40 fps (120 Hz screen)</string>
+    <string name="fps_120">120 fps (120 Hz screen)</string>
+    <string name="gyro_recalibrated">Gyro recalibrated</string>
+    <string name="opt_drawdone">Experimental: GX2DrawDone</string>
+    <string name="opt_drawdone_hint">Lets the game prepare the next frame while the renderer works. May cause visual glitches: for testing only.</string>
+    <string-array name="drawdone_modes">
+        <item>Wait (default)</item>
+        <item>One behind</item>
+        <item>No wait</item>
+    </string-array>
+    <string name="opt_core_mode">CPU cores</string>
+    <string name="opt_core_mode_hint">Where the game and renderer run. Performance cores: least heat for steady play. Prime core: fastest renderer, hottest.</string>
+    <string-array name="core_modes">
+        <item>Automatic</item>
+        <item>Performance cores</item>
+        <item>Prime core (renderer)</item>
+        <item>Prime core (game)</item>
+    </string-array>
 </resources>
