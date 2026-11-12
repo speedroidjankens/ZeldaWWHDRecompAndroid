@@ -23,7 +23,7 @@ jobs:
       run: chmod +x android/gradlew
     - name: Build with Gradle
       working-directory: android
-      run: ./gradlew assembleDebug
+      run: ./gradlew assembleDebug -PwwhdDeviceRecomp
 
     - name: Upload APK
       uses: actions/upload-artifact@v4
