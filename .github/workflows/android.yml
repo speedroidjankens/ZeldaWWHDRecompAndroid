@@ -19,10 +19,21 @@ jobs:
         distribution: 'temurin'
         cache: gradle
 
+    - name: Cache LLVM
+      uses: actions/cache@v4
+      with:
+        path: build/llvm
+        key: llvm-20.1.8-${{ runner.os }}-${{ hashFiles('tools/android/build-llvm.sh') }}
+
+    - name: Build LLVM
+      run: tools/android/build-llvm.sh
+
     - name: Grant execute permission for gradlew
       run: chmod +x android/gradlew
     - name: Build with Gradle
       working-directory: android
+      env:
+        GRADLE_OPTS: -Xmx2g
       run: ./gradlew assembleDebug -PwwhdDeviceRecomp
 
     - name: Upload APK
